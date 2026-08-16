@@ -9,6 +9,8 @@ on:
 jobs:
   check-signal:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -27,3 +29,11 @@ jobs:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
         run: python smc_strategy.py
+
+      - name: Save signal history
+        run: |
+          git config user.name "SMC Bot"
+          git config user.email "bot@smcbot.local"
+          git add signal_history.csv
+          git diff --quiet --cached || git commit -m "Update signal history"
+          git push

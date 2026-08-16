@@ -11,8 +11,18 @@ import csv
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import os
+
+# ─── TIMEZONE (Pakistan Standard Time = UTC+5) ──────────────────────────────
+PKT = timezone(timedelta(hours=5))
+
+
+def to_pkt(dt):
+    """Convert any datetime (naive or UTC-aware) to Pakistan Time for display."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(PKT)
 
 # ─── SETTINGS (same as your Pine Script) ────────────────────────────────────
 LOOKBACK_LEN = 100        # Fibonacci lookback (candles)
@@ -192,29 +202,77 @@ def log_to_csv(time, price, signal, reason):
 
 def run_check():
     """Main function: fetch data, check for signal, alert if found, log every check."""
-    print(f"[{datetime.now()}] Fetching {SYMBOL} data...")
-    df = fetch_candles()
-    df = calculate_indicators(df)
-    signal, reason = check_retest_signals(df)
+    try:
+        print(f"[{datetime.now()}] Fetching {SYMBOL} data...")
+        df = fetch_candles()
+        df = calculate_indicators(df)
+        signal, reason = check_retest_signals(df)
 
-    last_price = df.iloc[-1]["close"]
-    last_time = df.iloc[-1]["time"]
+        last_price = df.iloc[-1]["close"]
+        last_time_utc = df.iloc[-1]["time"]
+        last_time_pkt = to_pkt(last_time_utc.to_pydatetime())
+        last_time_str = last_time_pkt.strftime("%Y-%m-%d %I:%M %p PKT")
 
-    log_to_csv(last_time, last_price, signal, reason)
+        log_to_csv(last_time_str, last_price, signal, reason)
 
-    if signal:
-        msg = (
-            f"🔔 {signal} Signal — {SYMBOL}\n"
-            f"Time: {last_time}\n"
-            f"Price: {last_price:.5f}\n"
-            f"Reason: {reason}\n"
-            f"Timeframe: {INTERVAL}"
-        )
-        print(msg)
-        send_discord_alert(msg)
+        if signal:
+            msg = (
+                f"🔔 {signal} Signal — {SYMBOL}\n"
+                f"Time: {last_time_str}\n"
+                f"Price: {last_price:.5f}\n"
+                f"Reason: {reason}\n"
+                f"Timeframe: {INTERVAL}"
+            )
+            print(msg)
+            send_discord_alert(msg)
+        else:
+            print(f"No signal at {last_time_str}, price {last_price:.5f}")
+
+    except Exception as e:
+        error_msg = f"⚠️ Bot Error — check failed:\n{str(e)}"
+        print(error_msg)
+        try:
+            send_discord_alert(error_msg)
+        except Exception:
+            print("Could not even send the error alert to Discord.")
+        raise  # re-raise so GitHub Actions also marks this run as failed
+
+
+def send_daily_summary():
+    """Reads today's entries from signal_history.csv and sends a summary
+    of only BUY/SELL signals (no 'No Signal' spam) to Discord."""
+    file_path = "signal_history.csv"
+    if not os.path.isfile(file_path):
+        send_discord_alert("📊 Daily Summary: No history file found yet.")
+        return
+
+    df = pd.read_csv(file_path)
+    # Time column is stored as "YYYY-MM-DD HH:MM AM/PM PKT" strings
+    df["Time_parsed"] = pd.to_datetime(
+        df["Time"].str.replace(" PKT", "", regex=False), format="%Y-%m-%d %I:%M %p"
+    )
+
+    today_pkt = datetime.now(PKT).date()
+    today_df = df[df["Time_parsed"].dt.date == today_pkt]
+
+    signals_df = today_df[today_df["Signal"] != "No Signal"]
+    buy_count = (signals_df["Signal"] == "BUY").sum()
+    sell_count = (signals_df["Signal"] == "SELL").sum()
+
+    if len(signals_df) == 0:
+        msg = f"📊 Daily Summary ({today_pkt}): No BUY/SELL signals today."
     else:
-        print(f"No signal at {last_time}, price {last_price:.5f}")
+        lines = [f"📊 Daily Summary ({today_pkt})", f"Total signals: {len(signals_df)} (BUY: {buy_count}, SELL: {sell_count})", ""]
+        for _, row in signals_df.iterrows():
+            lines.append(f"• {row['Signal']} at {row['Time']} — price {row['Price']}")
+        msg = "\n".join(lines)
+
+    send_discord_alert(msg)
 
 
 if __name__ == "__main__":
-    run_check()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "summary":
+        send_daily_summary()
+    else:
+        run_check()

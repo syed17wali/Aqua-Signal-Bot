@@ -3,7 +3,8 @@ name: SMC Signal Checker
 # Runs every 15 minutes, automatically, forever — no laptop needed
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/15 * * * *"       # every 15 minutes — regular signal check
+    - cron: "0 19 * * *"          # 19:00 UTC = 00:00 (midnight) PKT — daily summary
   workflow_dispatch:  # allows manual trigger from GitHub website too
 
 jobs:
@@ -28,7 +29,12 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
-        run: python smc_strategy.py
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 19 * * *" ]; then
+            python smc_strategy.py summary
+          else
+            python smc_strategy.py
+          fi
 
       - name: Save signal history
         run: |

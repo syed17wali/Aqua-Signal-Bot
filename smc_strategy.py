@@ -7,6 +7,7 @@ Replicates the TradingView Pine Script strategy:
 - Zone-birth and zone-retest confirmation
 """
 
+import csv
 import requests
 import numpy as np
 import pandas as pd
@@ -177,8 +178,20 @@ def send_discord_alert(message):
     return resp
 
 
+def log_to_csv(time, price, signal, reason):
+    """Append every check result to a CSV file (creates it if not present)."""
+    file_path = "signal_history.csv"
+    file_exists = os.path.isfile(file_path)
+
+    with open(file_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(["Time", "Price", "Signal", "Reason"])
+        writer.writerow([time, price, signal if signal else "No Signal", reason if reason else ""])
+
+
 def run_check():
-    """Main function: fetch data, check for signal, alert if found."""
+    """Main function: fetch data, check for signal, alert if found, log every check."""
     print(f"[{datetime.now()}] Fetching {SYMBOL} data...")
     df = fetch_candles()
     df = calculate_indicators(df)
@@ -186,6 +199,8 @@ def run_check():
 
     last_price = df.iloc[-1]["close"]
     last_time = df.iloc[-1]["time"]
+
+    log_to_csv(last_time, last_price, signal, reason)
 
     if signal:
         msg = (

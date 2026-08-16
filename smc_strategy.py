@@ -247,10 +247,13 @@ def send_daily_summary():
         return
 
     df = pd.read_csv(file_path)
-    # Time column is stored as "YYYY-MM-DD HH:MM AM/PM PKT" strings
+    # Time column may have mixed formats (old entries vs new PKT-formatted ones)
     df["Time_parsed"] = pd.to_datetime(
-        df["Time"].str.replace(" PKT", "", regex=False), format="%Y-%m-%d %I:%M %p"
+        df["Time"].astype(str).str.replace(" PKT", "", regex=False),
+        format="mixed",
+        errors="coerce"
     )
+    df = df.dropna(subset=["Time_parsed"])
 
     today_pkt = datetime.now(PKT).date()
     today_df = df[df["Time_parsed"].dt.date == today_pkt]

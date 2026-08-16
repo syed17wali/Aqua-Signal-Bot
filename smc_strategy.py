@@ -25,9 +25,9 @@ API_KEY = os.environ.get("TWELVEDATA_API_KEY", "YOUR_API_KEY_HERE")
 SYMBOL = "EUR/USD"
 INTERVAL = "15min"
 
-# ─── TELEGRAM SETTINGS ───────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+# ─── DISCORD SETTINGS ─────────────────────────────────────────────────────
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "YOUR_CHANNEL_ID_HERE")
 
 
 def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200):
@@ -163,12 +163,18 @@ def check_retest_signals(df):
     return None, None
 
 
-def send_telegram_alert(message):
-    """Send a notification via Telegram bot."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    resp = requests.post(url, data=payload, timeout=15)
-    return resp.json()
+def send_discord_alert(message):
+    """Send a notification via Discord bot to the configured channel."""
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"content": message}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    if resp.status_code not in (200, 201):
+        print(f"Discord send failed: {resp.status_code} {resp.text}")
+    return resp
 
 
 def run_check():
@@ -190,7 +196,7 @@ def run_check():
             f"Timeframe: {INTERVAL}"
         )
         print(msg)
-        send_telegram_alert(msg)
+        send_discord_alert(msg)
     else:
         print(f"No signal at {last_time}, price {last_price:.5f}")
 

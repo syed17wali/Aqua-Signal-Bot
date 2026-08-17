@@ -1,8 +1,20 @@
 name: SMC Signal Checker
 
-# Triggered externally by cron-job.org every 15 minutes for reliable timing
+# Triggered externally by cron-job.org (not by GitHub's own schedule).
+# GitHub's native `schedule:` trigger is intentionally NOT used here —
+# cron-job.org handles the every-15-min timing, to avoid duplicate runs
+# and duplicate entries in signal_history.csv.
+#
+# cron-job.org must call this with body {"ref":"main"} for the regular
+# 15-min check, and a separate job (or same job with a param) is needed
+# for the midnight PKT summary — see note in Run signal check step below.
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # triggered by cron-job.org's HTTP POST, or manually from GitHub website
+    inputs:
+      mode:
+        description: "check (regular signal check) or summary (daily summary)"
+        required: false
+        default: "check"
 
 jobs:
   check-signal:
@@ -26,7 +38,12 @@ jobs:
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
-        run: python smc_strategy.py
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "summary" ]; then
+            python smc_strategy.py summary
+          else
+            python smc_strategy.py
+          fi
 
       - name: Save signal history
         run: |

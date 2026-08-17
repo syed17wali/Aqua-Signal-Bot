@@ -1,29 +1,35 @@
-# SMC Signal Bot — Complete Setup Guide
+# SMC Signal Bot — Complete Setup Guide (Discord version)
 
 Yeh bot aapke laptop ke bina, 24/7, free mein chalega aur EURUSD signals
-Telegram par bhejega. Neeche diye steps follow karein.
+**Discord** channel par bhejega. Timing cron-job.org se control hoti hai
+(GitHub ka apna schedule use nahi ho raha — is se signal_history.csv mein
+duplicate entries nahi banengi).
 
 ---
 
-## STEP 1: Telegram Bot Banayein (5 minute)
+## STEP 1: Discord Bot Banayein (5 minute)
 
-1. Telegram app kholein, search karein: **@BotFather**
-2. BotFather ko message karein: `/newbot`
-3. Bot ka naam do (jo bhi chaho, jaise "Wali SMC Alerts")
-4. Username do (unique hona chahiye, jaise `wali_smc_bot`)
-5. BotFather aapko ek **TOKEN** dega — kuch aisa dikhega:
-   `123456789:ABCdefGhIjKlmNoPQRsTUVwxyZ`
-   **Yeh save kar lo — isko TELEGRAM_BOT_TOKEN kehte hain**
+1. Jao: https://discord.com/developers/applications
+2. **"New Application"** click karo, koi bhi naam do (jaise "SMC Alerts")
+3. Left sidebar mein **"Bot"** tab par jao
+4. **"Reset Token"** (ya "Add Bot" agar pehli baar hai) click karo, confirm karo
+5. Jo token dikhega usay copy kar lo — kuch aisa dikhega:
+   `MTA1234567890.GxxxYY.abcDEFghiJKLmnoPQRstuVWXyz`
+   **Yeh save kar lo — isko DISCORD_BOT_TOKEN kehte hain**
+   (Ek dafa page se hat gaye to dobara "Reset Token" karna padega)
 
-6. Ab apne naye bot ko dhundo Telegram search mein (jo username diya tha)
-   aur usay ek message bhejo (jaise "hi") — bot ko activate karne ke liye
+6. Left sidebar mein **"OAuth2" → "URL Generator"** par jao
+7. **Scopes** mein `bot` check karo
+8. **Bot Permissions** mein `Send Messages` aur `Read Message History` check karo
+9. Neeche generated URL copy karo, browser mein kholo, apna Discord server
+   select karke bot ko **invite/add** kar lo apne server mein
 
-7. Apna **Chat ID** nikalne ke liye, browser mein yeh URL kholo
-   (apna token daal ke):
-   `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-
-   Isme "chat":{"id": 123456789} dikhega — yeh number save kar lo,
-   **yeh TELEGRAM_CHAT_ID hai**
+10. Apne Discord server mein wo channel kholo jahan alerts aane chahiye
+    (ya naya channel bana lo, jaise `#smc-signals`)
+11. Channel ka naam par right-click karo → **"Copy Channel ID"**
+    (agar yeh option nahi dikhta: Discord app mein **User Settings → Advanced
+    → Developer Mode** on karo, phir right-click se ID copy hoga)
+    **Yeh number save kar lo — yeh DISCORD_CHANNEL_ID hai**
 
 ---
 
@@ -34,7 +40,7 @@ Telegram par bhejega. Neeche diye steps follow karein.
 3. Dashboard mein apni **API Key** milegi — save kar lo
    **Yeh TWELVEDATA_API_KEY hai**
 
-Free tier mein 800 calls/day milte hain — hamara bot din mein ~96 baar
+Free tier mein 800 calls/day milte hain — bot din mein ~96 baar
 check karega (har 15 min), yeh limit ke andar hai.
 
 ---
@@ -72,35 +78,51 @@ check karega (har 15 min), yeh limit ke andar hai.
    | Name | Value |
    |------|-------|
    | `TWELVEDATA_API_KEY` | (Step 2 wali key) |
-   | `TELEGRAM_BOT_TOKEN` | (Step 1 wala token) |
-   | `TELEGRAM_CHAT_ID` | (Step 1 wala chat ID) |
+   | `DISCORD_BOT_TOKEN` | (Step 1 wala bot token) |
+   | `DISCORD_CHANNEL_ID` | (Step 1 wali channel ID) |
 
 ---
 
-## STEP 6: Bot Ko Activate Karein
+## STEP 6: Timing Setup — cron-job.org (Yeh GitHub ke schedule ki jagah hai)
 
-1. Apne repository mein "Actions" tab par jao
-2. "SMC Signal Checker" workflow dikhega
-3. Agar disabled ho, "Enable workflow" click karo
-4. Ab yeh automatically **har 15 minute** mein chalega, hamesha,
-   bina kisi laptop ke — jab bhi signal aayega, Telegram par
-   message aa jayega
+Is version mein workflow **khud se** schedule pe nahi chalta
+(`workflow_dispatch` hi trigger hai) — cron-job.org (https://console.cron-job.org)
+se do jobs banao:
+
+**Job 1 — Regular signal check (har 15 min):**
+- URL: `https://api.github.com/repos/<username>/<repo>/actions/workflows/check_signal.yml/dispatches`
+- Method: POST
+- Headers: `Authorization: token <YOUR_GITHUB_TOKEN>`, `Accept: application/vnd.github+json`, `Content-Type: application/json`
+- Schedule: Every 15 minutes
+- Body: `{"ref":"main"}`
+
+**Job 2 — Midnight PKT daily summary (din mein sirf 1 baar):**
+- Same URL, method, headers
+- Schedule: Daily, 12:00 AM (Asia/Karachi timezone select karna, taake PKT midnight ho)
+- Body: `{"ref":"main","inputs":{"mode":"summary"}}`
+
+Job 2 hi wo hai jo din bhar ke saare BUY/SELL signals gin ke ek summary
+Discord par bhejega. Job 1 sirf regular per-15-min check karta hai.
 
 ---
 
 ## Test Karne Ke Liye
 
 Workflow ko turant manually chalane ke liye:
-1. "Actions" tab > "SMC Signal Checker" > "Run workflow" button click karo
-2. 1-2 minute mein result Telegram par ya "Actions" log mein dikhega
+1. GitHub repo mein "Actions" tab > "SMC Signal Checker" > "Run workflow" button click karo
+   (isme bhi "mode" input dikhega — "check" ya "summary" choose kar sakte ho)
+2. Ya cron-job.org mein us job ke "Test Run" button se
+3. 1-2 minute mein result Discord par ya GitHub "Actions" log mein dikhega
 
 ---
 
 ## Important Notes
 
 - Yeh **completely free** hai — GitHub Actions free tier mein 2000
-  minutes/month milte hain, hamara script sirf kuch second leta hai
-  har run mein, kaafi zyada hai
+  minutes/month milte hain, script sirf kuch second leta hai har run mein
 - Yeh TradingView se bilkul independent hai — koi violation nahi
-- Agar signal miss ho jaye kisi wajah se, GitHub Actions ka "Actions"
-  tab check kar sakte ho — har run ka log wahan save rehta hai
+- Timing **cron-job.org** control karta hai, GitHub ka apna schedule
+  jaan-boojh kar off rakha gaya hai (duplicate history entries se bachne ke liye)
+- Agar signal miss ho jaye kisi wajah se, GitHub "Actions" tab check karo —
+  har run ka log wahan save rehta hai, aur cron-job.org ki "History" mein
+  bhi request/response dikhta hai

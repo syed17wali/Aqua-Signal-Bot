@@ -41,8 +41,15 @@ DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "YOUR_CHANNEL_ID_HERE")
 
 
-def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200):
-    """Fetch recent candle data from Twelve Data free API."""
+def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200, max_retries=3):
+    """Fetch recent candle data from Twelve Data free API.
+
+    Retries a few times with a short backoff if the API is briefly slow
+    or unreachable (ReadTimeout / ConnectionError), instead of failing
+    the whole run on a single transient network hiccup.
+    """
+    import time as _time
+
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
@@ -51,8 +58,20 @@ def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200):
         "apikey": API_KEY,
         "format": "JSON"
     }
-    resp = requests.get(url, params=params, timeout=15)
-    data = resp.json()
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=30)
+            data = resp.json()
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            last_error = e
+            print(f"[Attempt {attempt}/{max_retries}] Twelve Data request failed: {e}")
+            if attempt < max_retries:
+                _time.sleep(5 * attempt)  # 5s, then 10s backoff
+    else:
+        raise RuntimeError(f"Twelve Data API unreachable after {max_retries} attempts: {last_error}")
 
     if "values" not in data:
         raise RuntimeError(f"API error: {data}")
@@ -247,13 +266,10 @@ def send_daily_summary():
         return
 
     df = pd.read_csv(file_path)
-    # Time column may have mixed formats (old entries vs new PKT-formatted ones)
+    # Time column is stored as "YYYY-MM-DD HH:MM AM/PM PKT" strings
     df["Time_parsed"] = pd.to_datetime(
-        df["Time"].astype(str).str.replace(" PKT", "", regex=False),
-        format="mixed",
-        errors="coerce"
+        df["Time"].str.replace(" PKT", "", regex=False), format="%Y-%m-%d %I:%M %p"
     )
-    df = df.dropna(subset=["Time_parsed"])
 
     today_pkt = datetime.now(PKT).date()
     today_df = df[df["Time_parsed"].dt.date == today_pkt]

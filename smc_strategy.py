@@ -44,17 +44,29 @@ DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "YOUR_CHANNEL_ID_HERE"
 def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200, max_retries=3):
     """Fetch recent candle data from Twelve Data free API.
 
-    Retries a few times with a short backoff if the API is briefly slow
-    or unreachable (ReadTimeout / ConnectionError), instead of failing
-    the whole run on a single transient network hiccup.
+    Instead of asking Twelve Data directly for 15-min candles (which on the
+    free REST tier can lag slightly behind live/WebSocket prices), this
+    fetches finer-grained 1-min candles and builds the 15-min bars locally
+    by resampling. This gets each 15-min bar's OHLC closer to what a
+    live chart (e.g. TradingView) would show, reducing feed staleness —
+    though it does NOT eliminate broker-to-broker methodology differences
+    (Twelve Data aggregates 60+ liquidity providers; a single broker like
+    OANDA will still differ slightly — that's inherent, not a bug).
+
+    Only fully-closed 15-min bars (i.e. bins with all 15 one-minute candles
+    present) are kept; the still-forming bar is dropped.
     """
     import time as _time
 
     url = "https://api.twelvedata.com/time_series"
+    # Fetch enough 1-min candles to cover the lookback window with buffer.
+    # outputsize=2500 minutes (~41.6 hours) comfortably covers
+    # LOOKBACK_LEN=100 15-min bars (=1500 minutes) plus retest window buffer.
+    one_min_outputsize = 2500
     params = {
         "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
+        "interval": "1min",
+        "outputsize": one_min_outputsize,
         "apikey": API_KEY,
         "format": "JSON",
         "timezone": "UTC"  # Twelve Data defaults to exchange-local time otherwise,
@@ -79,15 +91,30 @@ def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200, max_retries=
     if "values" not in data:
         raise RuntimeError(f"API error: {data}")
 
-    df = pd.DataFrame(data["values"])
-    df = df.rename(columns={
+    df1m = pd.DataFrame(data["values"])
+    df1m = df1m.rename(columns={
         "datetime": "time", "open": "open", "high": "high",
         "low": "low", "close": "close"
     })
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.sort_values("time").reset_index(drop=True)  # oldest -> newest
-    return df
+    df1m[["open", "high", "low", "close"]] = df1m[["open", "high", "low", "close"]].astype(float)
+    df1m["time"] = pd.to_datetime(df1m["time"])
+    df1m = df1m.sort_values("time").reset_index(drop=True)  # oldest -> newest
+
+    # ── Resample 1-min candles into 15-min bars ─────────────────────────
+    df1m = df1m.set_index("time")
+    ohlc = df1m.resample("15min", label="left", closed="left").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last"
+    })
+    # Only keep bins that actually have all 15 one-minute candles present —
+    # this drops the currently-forming (incomplete) bar and any gappy bins.
+    counts = df1m["close"].resample("15min", label="left", closed="left").count()
+    ohlc = ohlc[counts == 15]
+    ohlc = ohlc.dropna().reset_index()
+
+    if len(ohlc) == 0:
+        raise RuntimeError("Resampling 1-min data produced no complete 15-min bars — check data availability.")
+
+    return ohlc
 
 
 def calculate_indicators(df):

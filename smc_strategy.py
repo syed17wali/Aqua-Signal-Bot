@@ -266,10 +266,18 @@ def send_daily_summary():
         return
 
     df = pd.read_csv(file_path)
-    # Time column is stored as "YYYY-MM-DD HH:MM AM/PM PKT" strings
-    df["Time_parsed"] = pd.to_datetime(
-        df["Time"].str.replace(" PKT", "", regex=False), format="%Y-%m-%d %I:%M %p"
-    )
+
+    # Time column should be "YYYY-MM-DD HH:MM AM/PM PKT", but older/stray
+    # rows may be in a different format (e.g. 24-hour, no "PKT" suffix).
+    # format="mixed" + errors="coerce" handles both instead of crashing;
+    # any row that still can't be parsed is dropped and reported.
+    cleaned_time = df["Time"].astype(str).str.replace(" PKT", "", regex=False)
+    df["Time_parsed"] = pd.to_datetime(cleaned_time, format="mixed", errors="coerce")
+
+    bad_rows = df["Time_parsed"].isna().sum()
+    if bad_rows:
+        print(f"Warning: {bad_rows} row(s) in signal_history.csv had unparseable dates and were skipped.")
+    df = df.dropna(subset=["Time_parsed"])
 
     today_pkt = datetime.now(PKT).date()
     today_df = df[df["Time_parsed"].dt.date == today_pkt]

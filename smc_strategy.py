@@ -56,7 +56,10 @@ def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200, max_retries=
         "interval": interval,
         "outputsize": outputsize,
         "apikey": API_KEY,
-        "format": "JSON"
+        "format": "JSON",
+        "timezone": "UTC"  # Twelve Data defaults to exchange-local time otherwise,
+                            # which was being wrongly treated as UTC downstream
+                            # (caused candle timestamps to show ~10h off in PKT)
     }
 
     last_error = None

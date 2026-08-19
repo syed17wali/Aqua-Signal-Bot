@@ -50,5 +50,13 @@ jobs:
           git config user.name "SMC Bot"
           git config user.email "bot@smcbot.local"
           git add signal_history.csv
-          git diff --quiet --cached || git commit -m "Update signal history"
-          git push
+          if ! git diff --quiet --cached; then
+            git commit -m "Update signal history"
+            # Pull any commits made by a concurrent run before pushing,
+            # to avoid "rejected — fetch first" errors when two runs
+            # (e.g. a manual test + the cron trigger) overlap.
+            git pull --rebase origin main
+            git push
+          else
+            echo "No changes to commit."
+          fi

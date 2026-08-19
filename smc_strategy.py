@@ -30,91 +30,89 @@ FVG_SIZE_PCT = 0.05        # Min FVG size as % of price
 EMA_LEN = 25                # Trend filter EMA length
 FVG_WINDOW_BARS = 36       # Retest window (bars)
 
-# ─── DATA SOURCE (Twelve Data - free tier) ──────────────────────────────────
-# Get your free API key at https://twelvedata.com/apikey
-API_KEY = os.environ.get("TWELVEDATA_API_KEY", "YOUR_API_KEY_HERE")
-SYMBOL = "EUR/USD"
-INTERVAL = "15min"
+# ─── DATA SOURCE (Deriv WebSocket API — free, no signup needed) ────────────
+# app_id 1089 is Deriv's public testing app_id, works for reading market
+# data (candles) with no registration, no login, no API token — since this
+# only reads public price history, not account/trading data.
+# Optional: set DERIV_APP_ID secret to your own registered app_id later;
+# defaults to 1089 if not set.
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+SYMBOL = "frxEURUSD"      # Deriv's symbol for real EUR/USD forex (not synthetic)
+GRANULARITY = 900          # 15 minutes in seconds — matches the 15m timeframe
+INTERVAL = "15min"         # kept for Discord message display text
 
 # ─── DISCORD SETTINGS ─────────────────────────────────────────────────────
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "YOUR_CHANNEL_ID_HERE")
 
 
-def fetch_candles(symbol=SYMBOL, interval=INTERVAL, outputsize=200, max_retries=3):
-    """Fetch recent candle data from Twelve Data free API.
 
-    Instead of asking Twelve Data directly for 15-min candles (which on the
-    free REST tier can lag slightly behind live/WebSocket prices), this
-    fetches finer-grained 1-min candles and builds the 15-min bars locally
-    by resampling. This gets each 15-min bar's OHLC closer to what a
-    live chart (e.g. TradingView) would show, reducing feed staleness —
-    though it does NOT eliminate broker-to-broker methodology differences
-    (Twelve Data aggregates 60+ liquidity providers; a single broker like
-    OANDA will still differ slightly — that's inherent, not a bug).
+def fetch_candles(symbol=SYMBOL, granularity=GRANULARITY, count=300, max_retries=3):
+    """Fetch recent candle data directly from Deriv's WebSocket API.
 
-    Only fully-closed 15-min bars (i.e. bins with all 15 one-minute candles
-    present) are kept; the still-forming bar is dropped.
+    Deriv aggregates from its own liquidity providers as a single broker
+    (like OANDA/IG), not a 60+ source composite like Twelve Data — so this
+    should track a live chart (e.g. TradingView set to the Deriv feed)
+    much more closely than the old Twelve Data setup did.
+
+    Uses app_id 1089 (Deriv's public app_id for market-data/testing use —
+    no account registration, login, or API token needed since this only
+    reads public price history, never touches an account or places trades).
     """
+    import json
     import time as _time
+    import websocket as ws_client
 
-    url = "https://api.twelvedata.com/time_series"
-    # Fetch enough 1-min candles to cover the lookback window with buffer.
-    # outputsize=2500 minutes (~41.6 hours) comfortably covers
-    # LOOKBACK_LEN=100 15-min bars (=1500 minutes) plus retest window buffer.
-    one_min_outputsize = 2500
-    params = {
-        "symbol": symbol,
-        "interval": "1min",
-        "outputsize": one_min_outputsize,
-        "apikey": API_KEY,
-        "format": "JSON",
-        "timezone": "UTC"  # Twelve Data defaults to exchange-local time otherwise,
-                            # which was being wrongly treated as UTC downstream
-                            # (caused candle timestamps to show ~10h off in PKT)
+    url = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    request = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": count,
+        "end": "latest",
+        "start": 1,
+        "style": "candles",
+        "granularity": granularity,
     }
 
     last_error = None
+    candles = None
     for attempt in range(1, max_retries + 1):
         try:
-            resp = requests.get(url, params=params, timeout=30)
-            data = resp.json()
+            conn = ws_client.create_connection(url, timeout=30)
+            conn.send(json.dumps(request))
+            response = json.loads(conn.recv())
+            conn.close()
+
+            if "error" in response:
+                raise RuntimeError(f"Deriv API error: {response['error']}")
+            candles = response.get("candles")
+            if not candles:
+                raise RuntimeError(f"No candles in Deriv response: {response}")
             break
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        except Exception as e:
             last_error = e
-            print(f"[Attempt {attempt}/{max_retries}] Twelve Data request failed: {e}")
+            print(f"[Attempt {attempt}/{max_retries}] Deriv API request failed: {e}")
             if attempt < max_retries:
                 _time.sleep(5 * attempt)  # 5s, then 10s backoff
     else:
-        raise RuntimeError(f"Twelve Data API unreachable after {max_retries} attempts: {last_error}")
+        raise RuntimeError(f"Deriv API unreachable after {max_retries} attempts: {last_error}")
 
-    if "values" not in data:
-        raise RuntimeError(f"API error: {data}")
+    # Drop the currently-forming (not yet closed) candle if present —
+    # Deriv sometimes includes it as the last entry.
+    now_epoch = int(_time.time())
+    if candles[-1]["epoch"] + granularity > now_epoch:
+        candles = candles[:-1]
 
-    df1m = pd.DataFrame(data["values"])
-    df1m = df1m.rename(columns={
-        "datetime": "time", "open": "open", "high": "high",
-        "low": "low", "close": "close"
-    })
-    df1m[["open", "high", "low", "close"]] = df1m[["open", "high", "low", "close"]].astype(float)
-    df1m["time"] = pd.to_datetime(df1m["time"])
-    df1m = df1m.sort_values("time").reset_index(drop=True)  # oldest -> newest
+    if not candles:
+        raise RuntimeError("No fully-closed candles available after filtering the forming bar.")
 
-    # ── Resample 1-min candles into 15-min bars ─────────────────────────
-    df1m = df1m.set_index("time")
-    ohlc = df1m.resample("15min", label="left", closed="left").agg({
-        "open": "first", "high": "max", "low": "min", "close": "last"
-    })
-    # Only keep bins that actually have all 15 one-minute candles present —
-    # this drops the currently-forming (incomplete) bar and any gappy bins.
-    counts = df1m["close"].resample("15min", label="left", closed="left").count()
-    ohlc = ohlc[counts == 15]
-    ohlc = ohlc.dropna().reset_index()
+    df = pd.DataFrame(candles)
+    df = df.rename(columns={"epoch": "time"})
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    df = df.sort_values("time").reset_index(drop=True)  # oldest -> newest
 
-    if len(ohlc) == 0:
-        raise RuntimeError("Resampling 1-min data produced no complete 15-min bars — check data availability.")
-
-    return ohlc
+    return df
 
 
 def calculate_indicators(df):

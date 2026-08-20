@@ -329,8 +329,8 @@ async def main():
         async def handle_shutdown():
             await send_discord_alert(
                 session,
-                "😴 Bot is spinning down (Render inactivity timeout or redeploy). "
-                "It will restart automatically once the health URL is pinged again."
+                "🔄 This instance is restarting (new deploy, or Render's own maintenance). "
+                "A fresh instance will confirm itself shortly."
             )
             await asyncio.sleep(1)  # give the HTTP request a moment to actually go out
             os._exit(0)

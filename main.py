@@ -179,7 +179,11 @@ async def send_discord_alert(session, message):
 
 
 # ─── CANDLE REFRESH LOOP (rebuilds active FVG list every 15 min) ────────
+candle_refresh_failures = 0
+
+
 async def refresh_candles(session):
+    global candle_refresh_failures
     try:
         df = await fetch_closed_candles(count=300)
         df = calculate_indicators(df)
@@ -190,14 +194,27 @@ async def refresh_candles(session):
             state["ema"] = context["ema"]
             state["mid_level"] = context["mid_level"]
         print(f"[{datetime.now(PKT)}] Refreshed. Active FVGs: {len(active_bull)} bull, {len(active_bear)} bear.")
+
+        if candle_refresh_failures >= 2:
+            await send_discord_alert(session, "✅ Candle refresh recovered — back to normal.")
+        candle_refresh_failures = 0
+        return True
     except Exception as e:
-        err = f"⚠️ Candle refresh failed: {e}"
+        candle_refresh_failures += 1
+        err = f"⚠️ Candle refresh failed ({candle_refresh_failures}x): {e}"
         print(err)
         await send_discord_alert(session, err)
+        return False
 
 
 async def refresh_candles_loop(session):
-    await refresh_candles(session)
+    ok = await refresh_candles(session)
+    if ok:
+        await send_discord_alert(
+            session,
+            f"✅ Bot fully initialized — {len(state['active_bull'])} active bull / "
+            f"{len(state['active_bear'])} active bear FVGs. Live monitoring is running."
+        )
     while True:
         now = time.time()
         wait_seconds = GRANULARITY - (now % GRANULARITY) + 10

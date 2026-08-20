@@ -1,128 +1,114 @@
-# SMC Signal Bot — Complete Setup Guide (Discord version)
+# SMC Real-Time Signal Bot — Complete Setup Guide (Deriv + Render version)
 
-Yeh bot aapke laptop ke bina, 24/7, free mein chalega aur EURUSD signals
-**Discord** channel par bhejega. Timing cron-job.org se control hoti hai
-(GitHub ka apna schedule use nahi ho raha — is se signal_history.csv mein
-duplicate entries nahi banengi).
+Yeh bot 24/7 chalega (laptop ki zaroorat nahi) aur **real-time** BUY/SELL
+signals Discord par bhejega — 15-min candle close hone ka wait nahi karega,
+jaise hi price FVG retest zone touch kare (trend confirm ke saath), turant
+alert aa jayega. Data source **Deriv** (real forex feed, `frxEURUSD`) hai.
 
 ---
 
-## STEP 1: Discord Bot Banayein (5 minute)
+## STEP 1: Discord Bot Banayein (agar pehle se nahi hai)
 
 1. Jao: https://discord.com/developers/applications
-2. **"New Application"** click karo, koi bhi naam do (jaise "SMC Alerts")
-3. Left sidebar mein **"Bot"** tab par jao
-4. **"Reset Token"** (ya "Add Bot" agar pehli baar hai) click karo, confirm karo
-5. Jo token dikhega usay copy kar lo — kuch aisa dikhega:
-   `MTA1234567890.GxxxYY.abcDEFghiJKLmnoPQRstuVWXyz`
-   **Yeh save kar lo — isko DISCORD_BOT_TOKEN kehte hain**
-   (Ek dafa page se hat gaye to dobara "Reset Token" karna padega)
-
-6. Left sidebar mein **"OAuth2" → "URL Generator"** par jao
-7. **Scopes** mein `bot` check karo
-8. **Bot Permissions** mein `Send Messages` aur `Read Message History` check karo
-9. Neeche generated URL copy karo, browser mein kholo, apna Discord server
-   select karke bot ko **invite/add** kar lo apne server mein
-
-10. Apne Discord server mein wo channel kholo jahan alerts aane chahiye
-    (ya naya channel bana lo, jaise `#smc-signals`)
-11. Channel ka naam par right-click karo → **"Copy Channel ID"**
-    (agar yeh option nahi dikhta: Discord app mein **User Settings → Advanced
-    → Developer Mode** on karo, phir right-click se ID copy hoga)
-    **Yeh number save kar lo — yeh DISCORD_CHANNEL_ID hai**
+2. **"New Application"** → koi bhi naam do (jaise "SMC Alerts")
+3. Left sidebar mein **"Bot"** tab → **"Reset Token"** (ya "Add Bot")
+4. Jo token dikhega, save kar lo — **yeh DISCORD_BOT_TOKEN hai**
+5. **"OAuth2" → "URL Generator"** → Scopes mein `bot` check karo
+6. Bot Permissions mein `Send Messages` check karo
+7. Generated URL browser mein kholo, apna Discord server select karke bot invite kar lo
+8. Jis channel mein alerts chahiye, uska naam right-click → **"Copy Channel ID"**
+   (Developer Mode on karna pade to: User Settings → Advanced → Developer Mode)
+   **Yeh number save kar lo — DISCORD_CHANNEL_ID hai**
 
 ---
 
-## STEP 2: Free Data API Key Lein (2 minute)
+## STEP 2: Deriv App ID
 
-1. Jao: https://twelvedata.com/apikey
-2. Free account banao (email se sign up)
-3. Dashboard mein apni **API Key** milegi — save kar lo
-   **Yeh TWELVEDATA_API_KEY hai**
-
-Free tier mein 800 calls/day milte hain — bot din mein ~96 baar
-check karega (har 15 min), yeh limit ke andar hai.
+Kuch karne ki zaroorat nahi — bot **App ID 1089** use karta hai, jo Deriv ka
+public testing ID hai. Yeh bina signup/login ke free market data padhne ke
+liye kaam karta hai. Bas yaad rakho: **DERIV_APP_ID = 1089**
 
 ---
 
-## STEP 3: GitHub Account Banayein (agar nahi hai)
+## STEP 3: GitHub Repo Mein Sirf Yeh 2 Files Rakhein
 
-1. Jao: https://github.com/signup
-2. Free account banao
+Repo (`Aqua-Signal-Bot`) mein sirf yeh files honi chahiye:
 
----
+- `main.py`
+- `requirements.txt`
 
-## STEP 4: Code GitHub Par Upload Karein
-
-1. GitHub par login karke, top-right "+" > "New repository" click karo
-2. Naam do: `smc-signal-bot` (private rakhna better hai)
-3. "Create repository" click karo
-
-4. Is folder ke saare files (`smc_strategy.py`, `.github/workflows/check_signal.yml`)
-   apne naye repository mein upload karo:
-   - "Add file" > "Upload files" click karo
-   - Files drag-drop karo
-   - "Commit changes" click karo
-
-   **Important:** `.github/workflows/check_signal.yml` file ka path
-   bilkul waisa hi rehna chahiye (`.github/workflows/` folder ke andar)
+Baqi purani files (`smc_strategy.py`, `signal_history.csv`,
+`.github/workflows/*.yml`, purana `SETUP_GUIDE.md`) delete kar dena —
+naya bot inka kaam khud karta hai, aur dono system saath chalne se
+Discord par **duplicate alerts** aayenge.
 
 ---
 
-## STEP 5: Secrets Add Karein (Yeh Zaroori Hai)
+## STEP 4: Render.com Par Deploy Karein
 
-1. Apne repository mein jao > **Settings** tab
-2. Left side mein: **Secrets and variables** > **Actions**
-3. "New repository secret" click karo, teen secrets add karo ek ek karke:
+1. **render.com** par jao → **"Get Started"** → GitHub se login karo
+2. Dashboard mein **"New +" → "Web Service"**
+3. Apna `Aqua-Signal-Bot` repo connect karo
+4. Settings:
+   - **Environment:** Python 3
+   - **Build Command:** `pip install -r requirements.txt`
+   - **Start Command:** `python main.py`
+   - **Instance Type:** Free
+5. **Environment Variables** add karo:
 
-   | Name | Value |
-   |------|-------|
-   | `TWELVEDATA_API_KEY` | (Step 2 wali key) |
-   | `DISCORD_BOT_TOKEN` | (Step 1 wala bot token) |
+   | Key | Value |
+   |---|---|
+   | `DERIV_APP_ID` | `1089` |
+   | `DISCORD_BOT_TOKEN` | (Step 1 wala token) |
    | `DISCORD_CHANNEL_ID` | (Step 1 wali channel ID) |
 
----
-
-## STEP 6: Timing Setup — cron-job.org (Yeh GitHub ke schedule ki jagah hai)
-
-Is version mein workflow **khud se** schedule pe nahi chalta
-(`workflow_dispatch` hi trigger hai) — cron-job.org (https://console.cron-job.org)
-se do jobs banao:
-
-**Job 1 — Regular signal check (har 15 min):**
-- URL: `https://api.github.com/repos/<username>/<repo>/actions/workflows/check_signal.yml/dispatches`
-- Method: POST
-- Headers: `Authorization: token <YOUR_GITHUB_TOKEN>`, `Accept: application/vnd.github+json`, `Content-Type: application/json`
-- Schedule: Every 15 minutes
-- Body: `{"ref":"main"}`
-
-**Job 2 — Midnight PKT daily summary (din mein sirf 1 baar):**
-- Same URL, method, headers
-- Schedule: Daily, 12:00 AM (Asia/Karachi timezone select karna, taake PKT midnight ho)
-- Body: `{"ref":"main","inputs":{"mode":"summary"}}`
-
-Job 2 hi wo hai jo din bhar ke saare BUY/SELL signals gin ke ek summary
-Discord par bhejega. Job 1 sirf regular per-15-min check karta hai.
+6. **"Create Web Service"** dabao — 2-3 min mein deploy ho jayega
 
 ---
 
-## Test Karne Ke Liye
+## STEP 5: Confirm Karein Ke Bot Zinda Hai
 
-Workflow ko turant manually chalane ke liye:
-1. GitHub repo mein "Actions" tab > "SMC Signal Checker" > "Run workflow" button click karo
-   (isme bhi "mode" input dikhega — "check" ya "summary" choose kar sakte ho)
-2. Ya cron-job.org mein us job ke "Test Run" button se
-3. 1-2 minute mein result Discord par ya GitHub "Actions" log mein dikhega
+1. Render dashboard mein **"Logs"** tab kholo
+2. Yeh lines dikhni chahiyein:
+   - `Health server running on port ...`
+   - `Subscribed to live ticks for frxEURUSD`
+3. Discord channel mein **"🚀 SMC Real-Time Bot started."** message aana chahiye
+
+---
+
+## STEP 6: 24/7 Zinda Rakhne Ke Liye UptimeRobot (Zaroori)
+
+Render ka **free tier 15 min inactivity ke baad bot ko "sleep"** kar deta hai.
+Isay hamesha jagaye rakhne ke liye:
+
+1. **uptimerobot.com** par free account banao
+2. **"New Monitor"** → Type: **HTTP(s)**
+3. URL: apne Render service ka public URL (jaise `https://your-app.onrender.com`)
+4. Monitoring Interval: **5 minutes**
+5. Save karo
+
+Yeh har 5 min bot ke health-check endpoint ko "ping" karega, jisse Render
+usay kabhi sone nahi dega.
+
+---
+
+## Bot Kya Karta Hai (Summary)
+
+- Har 15 min pe khud candles refresh kar ke EMA, swing high/low, aur
+  active FVG zones dobara calculate karta hai
+- Live price stream (Deriv se, har second) continuously monitor karta hai
+- Jaise hi price kisi active FVG zone ko retest kare (trend ke sath match),
+  **turant** Discord par alert bhejta hai — candle close ka wait nahi karta
+- Agar connection kabhi disconnect ho, khud 10 sec mein dobara jud jata hai
+- Raat 12 baje PKT us din ka BUY/SELL total count Discord par bhejta hai
 
 ---
 
 ## Important Notes
 
-- Yeh **completely free** hai — GitHub Actions free tier mein 2000
-  minutes/month milte hain, script sirf kuch second leta hai har run mein
-- Yeh TradingView se bilkul independent hai — koi violation nahi
-- Timing **cron-job.org** control karta hai, GitHub ka apna schedule
-  jaan-boojh kar off rakha gaya hai (duplicate history entries se bachne ke liye)
-- Agar signal miss ho jaye kisi wajah se, GitHub "Actions" tab check karo —
-  har run ka log wahan save rehta hai, aur cron-job.org ki "History" mein
-  bhi request/response dikhta hai
+- **Completely free** — Deriv free, Render free tier, UptimeRobot free
+- Is version mein `signal_history.csv` jaisi permanent file nahi hai —
+  daily count sirf memory mein rehta hai (agar Render kabhi restart ho,
+  usi din ka partial count reset ho sakta hai — summary agle din se
+  theek chalta rahega)
+- Kuch masla ho to Render ke **"Logs"** tab mein error dikh jayega

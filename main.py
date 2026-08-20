@@ -4,11 +4,26 @@ Persistent process: live Deriv tick stream + intra-candle FVG retest detection.
 """
 
 import asyncio
+import functools
 import json
 import os
 import signal
+import sys
 import time
 from datetime import datetime, timezone, timedelta
+
+# ─── FORCE UNBUFFERED STDOUT ─────────────────────────────────────────────
+# Render (and most container hosts) capture stdout via a pipe, not a
+# terminal. Python's default is to block-buffer output to pipes, so
+# print() lines can sit in an internal buffer for a long time before they
+# actually show up in the log viewer — it *looks* like the code isn't
+# running even though it is. Forcing every print() to flush immediately
+# fixes that.
+print = functools.partial(print, flush=True)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # older Python without reconfigure(); the print() patch above still covers us
 
 import pandas as pd
 import websockets

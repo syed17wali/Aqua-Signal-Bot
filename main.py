@@ -274,7 +274,20 @@ async def tick_listener_loop(session):
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
+                # NOTE: a plain {"ticks": SYMBOL, "subscribe": 1} request was being
+                # rejected by Deriv with "Symbol frxEURUSD is invalid", even though
+                # the exact same symbol works fine for "ticks_history" (used below
+                # for candles). Using "ticks_history" with subscribe:1 instead gets
+                # us onto the same request path that's already proven to work, and
+                # it still pushes live "tick" messages after the initial snapshot.
+                await ws.send(json.dumps({
+                    "ticks_history": SYMBOL,
+                    "adjust_start_time": 1,
+                    "count": 1,
+                    "end": "latest",
+                    "style": "ticks",
+                    "subscribe": 1,
+                }))
                 print(f"[{datetime.now(PKT)}] Subscribed to live ticks for {SYMBOL}")
                 if consecutive_failures >= 3:
                     await send_discord_alert(session, "✅ Live tick stream reconnected — bot is back to normal.")

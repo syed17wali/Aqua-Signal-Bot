@@ -6,6 +6,7 @@ Persistent process: live Deriv tick stream + intra-candle FVG retest detection.
 import asyncio
 import json
 import os
+import signal
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -237,11 +238,15 @@ async def check_tick(session, price):
 
 async def tick_listener_loop(session):
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    consecutive_failures = 0
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
                 await ws.send(json.dumps({"ticks": SYMBOL, "subscribe": 1}))
                 print(f"[{datetime.now(PKT)}] Subscribed to live ticks for {SYMBOL}")
+                if consecutive_failures >= 3:
+                    await send_discord_alert(session, "✅ Live tick stream reconnected — bot is back to normal.")
+                consecutive_failures = 0
                 async for raw in ws:
                     data = json.loads(raw)
                     if "error" in data:
@@ -251,7 +256,15 @@ async def tick_listener_loop(session):
                     if tick:
                         await check_tick(session, float(tick["quote"]))
         except Exception as e:
-            print(f"⚠️ Tick stream disconnected: {e}. Reconnecting in 10s...")
+            consecutive_failures += 1
+            print(f"⚠️ Tick stream disconnected ({consecutive_failures}x): {e}. Reconnecting in 10s...")
+            # Only alert on the first drop and then every 3rd repeated failure,
+            # so a single brief network blip doesn't spam Discord.
+            if consecutive_failures == 1 or consecutive_failures % 3 == 0:
+                await send_discord_alert(
+                    session,
+                    f"⚠️ Live tick stream disconnected (attempt {consecutive_failures}): {e}\nRetrying..."
+                )
             await asyncio.sleep(10)
 
 
@@ -293,7 +306,26 @@ async def start_web_app():
 
 
 async def main():
+    loop = asyncio.get_running_loop()
     async with aiohttp.ClientSession() as session:
+
+        async def handle_shutdown():
+            await send_discord_alert(
+                session,
+                "😴 Bot is spinning down (Render inactivity timeout or redeploy). "
+                "It will restart automatically once the health URL is pinged again."
+            )
+            await asyncio.sleep(1)  # give the HTTP request a moment to actually go out
+            os._exit(0)
+
+        def on_sigterm():
+            asyncio.create_task(handle_shutdown())
+
+        try:
+            loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+        except NotImplementedError:
+            pass  # signal handlers aren't supported on some platforms — safe to skip
+
         await send_discord_alert(session, "🚀 SMC Real-Time Bot started.")
         await start_web_app()
         await asyncio.gather(
@@ -303,5 +335,28 @@ async def main():
         )
 
 
+def send_discord_alert_sync(message):
+    """Synchronous fallback used only when the async session is already gone
+    (i.e. the whole program is crashing) — used to send one last alert."""
+    import urllib.request
+    try:
+        url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"content": message}).encode("utf-8"),
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"Fatal-crash Discord alert also failed: {e}")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        crash_msg = f"🔴 FATAL: Bot crashed and is shutting down:\n{e}\nRender should auto-restart it shortly."
+        print(crash_msg)
+        send_discord_alert_sync(crash_msg)
+        raise

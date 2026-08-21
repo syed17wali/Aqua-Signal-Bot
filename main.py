@@ -5,6 +5,7 @@ Persistent process: live Deriv tick stream + intra-candle FVG retest detection.
 
 import asyncio
 import functools
+import gc
 import json
 import os
 import signal
@@ -213,6 +214,14 @@ async def refresh_candles(session):
             state["ema"] = context["ema"]
             state["mid_level"] = context["mid_level"]
         print(f"[{datetime.now(PKT)}] Refreshed. Active FVGs: {len(active_bull)} bull, {len(active_bear)} bear.")
+
+        # Free the DataFrame explicitly and force a GC pass. pandas/numpy can
+        # leave allocator-level memory unreturned to the OS even after Python
+        # itself has no more references — over many hours this shows up as
+        # slowly climbing RSS on a tightly-limited (512MB) free instance.
+        # This won't eliminate it entirely, but reduces how fast it grows.
+        del df
+        gc.collect()
 
         if candle_refresh_failures >= 2:
             await send_discord_alert(session, "✅ Candle refresh recovered — back to normal.")

@@ -271,6 +271,9 @@ async def check_tick(session, price):
 async def tick_listener_loop(session):
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     consecutive_failures = 0
+    tick_count = 0
+    last_heartbeat = time.time()
+
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
@@ -295,11 +298,20 @@ async def tick_listener_loop(session):
                 async for raw in ws:
                     data = json.loads(raw)
                     if "error" in data:
-                        print(f"Tick stream error: {data['error']}")
-                        continue
+                        # Any error here means this subscription is dead — don't sit
+                        # quietly "connected" but receiving nothing. Force a reconnect
+                        # instead, so we never silently stop monitoring live prices.
+                        raise RuntimeError(f"Tick stream error: {data['error']}")
                     tick = data.get("tick")
                     if tick:
+                        tick_count += 1
                         await check_tick(session, float(tick["quote"]))
+                        # Heartbeat log every ~5 min so logs directly confirm live
+                        # ticks are actually flowing (not just inferred indirectly).
+                        if time.time() - last_heartbeat >= 300:
+                            print(f"[{datetime.now(PKT)}] Heartbeat: {tick_count} ticks received in last ~5 min.")
+                            tick_count = 0
+                            last_heartbeat = time.time()
         except Exception as e:
             consecutive_failures += 1
             print(f"⚠️ Tick stream disconnected ({consecutive_failures}x): {e}. Reconnecting in 10s...")

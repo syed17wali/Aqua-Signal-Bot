@@ -39,22 +39,13 @@ GRANULARITY = 900          # 15 min in seconds
 SYMBOL = "frxEURUSD"
 
 DERIV_APP_ID = (os.environ.get("DERIV_APP_ID") or "1089").strip()
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "").strip()  # .strip() matters: a
-                                                            # trailing space/newline picked
-                                                            # up from copy-paste makes an
-                                                            # otherwise-correct token get
-                                                            # rejected as InvalidToken.
+# NOTE: DERIV_API_TOKEN / real Deriv account no longer needed. The bot only
+# ever reads public market data (candles), which Deriv serves anonymously —
+# it never authorizes as a specific account. This avoids Deriv's ongoing
+# token/app migration entirely (see fetch_current_forming_candle below).
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 PORT = int(os.environ.get("PORT", 10000))
-
-# Safe diagnostic — reveals length and prefix shape only, NEVER the token itself,
-# so we can confirm what Render actually loaded without leaking the secret.
-if DERIV_API_TOKEN:
-    print(f"DERIV_API_TOKEN loaded: length={len(DERIV_API_TOKEN)}, "
-          f"starts_with_pat_={DERIV_API_TOKEN.startswith('pat_')}")
-else:
-    print("DERIV_API_TOKEN loaded: EMPTY — env var not set or not saved on Render.")
 
 PKT = timezone(timedelta(hours=5))
 
@@ -287,85 +278,71 @@ async def check_price_update(session, price, candle_high, candle_low):
             daily_counts[signal] += 1
 
 
+async def fetch_current_forming_candle():
+    """Same anonymous call as fetch_closed_candles, but keeps the last
+    (possibly still-forming) candle instead of dropping it — this is how
+    we get near-real-time OHLC without needing any authorize/subscribe at
+    all, sidestepping Deriv's token/app_id auth entirely for this bot's
+    read-only needs."""
+    request = {
+        "ticks_history": SYMBOL,
+        "adjust_start_time": 1,
+        "count": 2,
+        "end": "latest",
+        "start": 1,
+        "style": "candles",
+        "granularity": GRANULARITY,
+    }
+    response = await deriv_request(request, timeout=15)
+    if "error" in response:
+        raise RuntimeError(f"Deriv API error: {response['error']}")
+    candles = response.get("candles")
+    if not candles:
+        raise RuntimeError(f"No candles in response: {response}")
+    latest = candles[-1]
+    return float(latest["close"]), float(latest["high"]), float(latest["low"])
+
+
+POLL_INTERVAL = 12  # seconds — frequent enough to catch intra-candle FVG
+                     # retests promptly, without hammering Deriv's API.
+
+
 async def tick_listener_loop(session):
-    uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+    """Polls the current forming candle every POLL_INTERVAL seconds instead
+    of using a live websocket subscription. This is deliberately simpler
+    and more robust than the previous authorize+subscribe approach: it
+    reuses the exact same anonymous, no-auth request that candle refresh
+    has used reliably throughout, so it isn't affected by Deriv's ongoing
+    API/token migration (new "pat_" tokens aren't accepted by the legacy
+    websocket "authorize" call, and registering a new-style app gives an
+    app_id that the legacy websocket endpoint itself rejects with HTTP
+    401 — both dead ends for this use case, and neither is needed here)."""
     consecutive_failures = 0
     update_count = 0
     last_heartbeat = time.time()
 
     while True:
         try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-                if DERIV_API_TOKEN:
-                    await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
-                    auth_resp = json.loads(await ws.recv())
-                    if "error" in auth_resp:
-                        raise RuntimeError(f"Deriv authorize failed: {auth_resp['error']}")
-                    print(f"[{datetime.now(PKT)}] Authorized with Deriv (read-only token).")
-                else:
-                    print("⚠️ DERIV_API_TOKEN not set — live forex subscription will likely fail "
-                          "with InvalidSymbol, since frx* symbols need an authorized session.")
-
-                # NOTE: raw {"ticks": SYMBOL, "subscribe": 1} was rejected by Deriv
-                # with "Symbol frxEURUSD is invalid" (and the ticks_history+style
-                # "ticks" workaround still hit the same error) — this appears to be
-                # a real restriction on raw tick-level streaming for forex symbols
-                # via this app_id. Live CANDLE subscription (style: "candles" +
-                # subscribe: 1) is the documented, working alternative — Deriv
-                # pushes continuously-updating open/high/low/close for the
-                # currently-forming bar, which is exactly what real-time FVG
-                # retest checking needs anyway (no manual high/low tracking
-                # required — Deriv already aggregates it for us).
-                await ws.send(json.dumps({
-                    "ticks_history": SYMBOL,
-                    "adjust_start_time": 1,
-                    "count": 1,
-                    "end": "latest",
-                    "style": "candles",
-                    "granularity": GRANULARITY,
-                    "subscribe": 1,
-                }))
-                print(f"[{datetime.now(PKT)}] Subscribed to live candle stream for {SYMBOL}")
-                if consecutive_failures >= 3:
-                    await send_discord_alert(session, "✅ Live price stream reconnected — bot is back to normal.")
-                consecutive_failures = 0
-                async for raw in ws:
-                    data = json.loads(raw)
-                    if "error" in data:
-                        # Any error here means this subscription is dead — don't sit
-                        # quietly "connected" but receiving nothing. Force a reconnect
-                        # instead, so we never silently stop monitoring live prices.
-                        raise RuntimeError(f"Price stream error: {data['error']}")
-                    ohlc = data.get("ohlc")
-                    if ohlc:
-                        update_count += 1
-                        await check_price_update(
-                            session,
-                            float(ohlc["close"]),
-                            float(ohlc["high"]),
-                            float(ohlc["low"]),
-                        )
-                        # Heartbeat log every ~5 min so logs directly confirm live
-                        # price updates are actually flowing (not just inferred).
-                        if time.time() - last_heartbeat >= 300:
-                            print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price updates received in last ~5 min.")
-                            update_count = 0
-                            last_heartbeat = time.time()
+            close, high, low = await fetch_current_forming_candle()
+            update_count += 1
+            await check_price_update(session, close, high, low)
+            if consecutive_failures >= 3:
+                await send_discord_alert(session, "✅ Live price polling recovered — bot is back to normal.")
+            consecutive_failures = 0
+            if time.time() - last_heartbeat >= 300:
+                print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price polls in last ~5 min.")
+                update_count = 0
+                last_heartbeat = time.time()
+            await asyncio.sleep(POLL_INTERVAL)
         except Exception as e:
             consecutive_failures += 1
-            # Back off the retry delay as failures pile up (capped at 2 min), so a
-            # persistent/non-transient error (like a bad token) doesn't hammer
-            # Deriv and Discord every 10 seconds forever.
             retry_delay = min(10 * consecutive_failures, 120)
-            print(f"⚠️ Price stream disconnected ({consecutive_failures}x): {e}. Reconnecting in {retry_delay}s...")
-            # Alert on the 1st, 2nd, and 3rd failure so real problems get noticed
-            # fast, then taper off to every 10th so a persistent issue doesn't
-            # spam Discord indefinitely.
+            print(f"⚠️ Price poll failed ({consecutive_failures}x): {e}. Retrying in {retry_delay}s...")
             should_alert = consecutive_failures <= 3 or consecutive_failures % 10 == 0
             if should_alert:
                 await send_discord_alert(
                     session,
-                    f"⚠️ Live price stream disconnected (attempt {consecutive_failures}): {e}\nRetrying..."
+                    f"⚠️ Live price polling failed (attempt {consecutive_failures}): {e}\nRetrying..."
                 )
             await asyncio.sleep(retry_delay)
 

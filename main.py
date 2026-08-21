@@ -46,7 +46,10 @@ PORT = int(os.environ.get("PORT", 10000))
 PKT = timezone(timedelta(hours=5))
 
 # ─── SHARED STATE ────────────────────────────────────────────────────────
-state = {"active_bull": [], "active_bear": [], "ema": None, "mid_level": None}
+state = {
+    "active_bull": [], "active_bear": [], "ema": None, "mid_level": None,
+    "current_bar_start": None, "running_high": None, "running_low": None,
+}
 state_lock = asyncio.Lock()
 
 daily_counts = {"BUY": 0, "SELL": 0}
@@ -238,9 +241,27 @@ async def refresh_candles_loop(session):
 
 
 # ─── LIVE TICK LISTENER (real-time intra-candle detection) ─────────────
-async def check_tick(session, price):
+async def check_tick(session, price, epoch):
     triggered = []
     async with state_lock:
+        # Track running high/low for the currently-forming 15-min candle,
+        # resetting when a new bar starts. This mirrors Pine's
+        # "touched = (low <= top) and (high >= bot)" check, which looks at
+        # the WHOLE candle's range — not just one exact price point. Using
+        # a single tick's exact price (the old approach) could miss a real
+        # touch if price moved through the zone quickly between two ticks.
+        bar_start = (epoch // GRANULARITY) * GRANULARITY
+        if state["current_bar_start"] != bar_start:
+            state["current_bar_start"] = bar_start
+            state["running_high"] = price
+            state["running_low"] = price
+        else:
+            state["running_high"] = max(state["running_high"], price)
+            state["running_low"] = min(state["running_low"], price)
+
+        running_high = state["running_high"]
+        running_low = state["running_low"]
+
         ema, mid = state["ema"], state["mid_level"]
         if ema is None or mid is None:
             return
@@ -248,12 +269,14 @@ async def check_tick(session, price):
         bearish_trend = price < ema
 
         for fvg in list(state["active_bull"]):
-            if fvg["bot"] <= price <= fvg["top"] and bullish_trend and price < fvg["mid"]:
+            touched = (running_low <= fvg["top"]) and (running_high >= fvg["bot"])
+            if touched and bullish_trend and price < fvg["mid"]:
                 triggered.append(("BUY", fvg))
                 state["active_bull"].remove(fvg)
 
         for fvg in list(state["active_bear"]):
-            if fvg["bot"] <= price <= fvg["top"] and bearish_trend and price > fvg["mid"]:
+            touched = (running_high >= fvg["bot"]) and (running_low <= fvg["top"])
+            if touched and bearish_trend and price > fvg["mid"]:
                 triggered.append(("SELL", fvg))
                 state["active_bear"].remove(fvg)
 
@@ -305,7 +328,7 @@ async def tick_listener_loop(session):
                     tick = data.get("tick")
                     if tick:
                         tick_count += 1
-                        await check_tick(session, float(tick["quote"]))
+                        await check_tick(session, float(tick["quote"]), int(tick["epoch"]))
                         # Heartbeat log every ~5 min so logs directly confirm live
                         # ticks are actually flowing (not just inferred indirectly).
                         if time.time() - last_heartbeat >= 300:

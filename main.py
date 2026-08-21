@@ -38,7 +38,7 @@ FVG_WINDOW_BARS = 36
 GRANULARITY = 900          # 15 min in seconds
 SYMBOL = "frxEURUSD"
 
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID") or "1089"
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")  # Read-only token; required for
                                                             # live forex subscriptions (frx*),
                                                             # since those need an authorized

@@ -46,10 +46,7 @@ PORT = int(os.environ.get("PORT", 10000))
 PKT = timezone(timedelta(hours=5))
 
 # ─── SHARED STATE ────────────────────────────────────────────────────────
-state = {
-    "active_bull": [], "active_bear": [], "ema": None, "mid_level": None,
-    "current_bar_start": None, "running_high": None, "running_low": None,
-}
+state = {"active_bull": [], "active_bear": [], "ema": None, "mid_level": None}
 state_lock = asyncio.Lock()
 
 daily_counts = {"BUY": 0, "SELL": 0}
@@ -241,27 +238,13 @@ async def refresh_candles_loop(session):
 
 
 # ─── LIVE TICK LISTENER (real-time intra-candle detection) ─────────────
-async def check_tick(session, price, epoch):
+async def check_price_update(session, price, candle_high, candle_low):
     triggered = []
     async with state_lock:
-        # Track running high/low for the currently-forming 15-min candle,
-        # resetting when a new bar starts. This mirrors Pine's
+        # candle_high/candle_low come directly from Deriv's live-updating
+        # candle stream for the currently-forming bar — this mirrors Pine's
         # "touched = (low <= top) and (high >= bot)" check, which looks at
-        # the WHOLE candle's range — not just one exact price point. Using
-        # a single tick's exact price (the old approach) could miss a real
-        # touch if price moved through the zone quickly between two ticks.
-        bar_start = (epoch // GRANULARITY) * GRANULARITY
-        if state["current_bar_start"] != bar_start:
-            state["current_bar_start"] = bar_start
-            state["running_high"] = price
-            state["running_low"] = price
-        else:
-            state["running_high"] = max(state["running_high"], price)
-            state["running_low"] = min(state["running_low"], price)
-
-        running_high = state["running_high"]
-        running_low = state["running_low"]
-
+        # the WHOLE candle's range, not just one exact price point.
         ema, mid = state["ema"], state["mid_level"]
         if ema is None or mid is None:
             return
@@ -269,13 +252,13 @@ async def check_tick(session, price, epoch):
         bearish_trend = price < ema
 
         for fvg in list(state["active_bull"]):
-            touched = (running_low <= fvg["top"]) and (running_high >= fvg["bot"])
+            touched = (candle_low <= fvg["top"]) and (candle_high >= fvg["bot"])
             if touched and bullish_trend and price < fvg["mid"]:
                 triggered.append(("BUY", fvg))
                 state["active_bull"].remove(fvg)
 
         for fvg in list(state["active_bear"]):
-            touched = (running_high >= fvg["bot"]) and (running_low <= fvg["top"])
+            touched = (candle_high >= fvg["bot"]) and (candle_low <= fvg["top"])
             if touched and bearish_trend and price > fvg["mid"]:
                 triggered.append(("SELL", fvg))
                 state["active_bear"].remove(fvg)
@@ -294,29 +277,34 @@ async def check_tick(session, price, epoch):
 async def tick_listener_loop(session):
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     consecutive_failures = 0
-    tick_count = 0
+    update_count = 0
     last_heartbeat = time.time()
 
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-                # NOTE: a plain {"ticks": SYMBOL, "subscribe": 1} request was being
-                # rejected by Deriv with "Symbol frxEURUSD is invalid", even though
-                # the exact same symbol works fine for "ticks_history" (used below
-                # for candles). Using "ticks_history" with subscribe:1 instead gets
-                # us onto the same request path that's already proven to work, and
-                # it still pushes live "tick" messages after the initial snapshot.
+                # NOTE: raw {"ticks": SYMBOL, "subscribe": 1} was rejected by Deriv
+                # with "Symbol frxEURUSD is invalid" (and the ticks_history+style
+                # "ticks" workaround still hit the same error) — this appears to be
+                # a real restriction on raw tick-level streaming for forex symbols
+                # via this app_id. Live CANDLE subscription (style: "candles" +
+                # subscribe: 1) is the documented, working alternative — Deriv
+                # pushes continuously-updating open/high/low/close for the
+                # currently-forming bar, which is exactly what real-time FVG
+                # retest checking needs anyway (no manual high/low tracking
+                # required — Deriv already aggregates it for us).
                 await ws.send(json.dumps({
                     "ticks_history": SYMBOL,
                     "adjust_start_time": 1,
                     "count": 1,
                     "end": "latest",
-                    "style": "ticks",
+                    "style": "candles",
+                    "granularity": GRANULARITY,
                     "subscribe": 1,
                 }))
-                print(f"[{datetime.now(PKT)}] Subscribed to live ticks for {SYMBOL}")
+                print(f"[{datetime.now(PKT)}] Subscribed to live candle stream for {SYMBOL}")
                 if consecutive_failures >= 3:
-                    await send_discord_alert(session, "✅ Live tick stream reconnected — bot is back to normal.")
+                    await send_discord_alert(session, "✅ Live price stream reconnected — bot is back to normal.")
                 consecutive_failures = 0
                 async for raw in ws:
                     data = json.loads(raw)
@@ -324,26 +312,51 @@ async def tick_listener_loop(session):
                         # Any error here means this subscription is dead — don't sit
                         # quietly "connected" but receiving nothing. Force a reconnect
                         # instead, so we never silently stop monitoring live prices.
-                        raise RuntimeError(f"Tick stream error: {data['error']}")
-                    tick = data.get("tick")
-                    if tick:
-                        tick_count += 1
-                        await check_tick(session, float(tick["quote"]), int(tick["epoch"]))
+                        raise RuntimeError(f"Price stream error: {data['error']}")
+                    ohlc = data.get("ohlc")
+                    if ohlc:
+                        update_count += 1
+                        await check_price_update(
+                            session,
+                            float(ohlc["close"]),
+                            float(ohlc["high"]),
+                            float(ohlc["low"]),
+                        )
                         # Heartbeat log every ~5 min so logs directly confirm live
-                        # ticks are actually flowing (not just inferred indirectly).
+                        # price updates are actually flowing (not just inferred).
                         if time.time() - last_heartbeat >= 300:
-                            print(f"[{datetime.now(PKT)}] Heartbeat: {tick_count} ticks received in last ~5 min.")
-                            tick_count = 0
+                            print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price updates received in last ~5 min.")
+                            update_count = 0
+                            last_heartbeat = time.time()
+                async for raw in ws:
+                    data = json.loads(raw)
+                    if "error" in data:
+                        # Any error here means this subscription is dead — don't sit
+                        # quietly "connected" but receiving nothing. Force a reconnect
+                        # instead, so we never silently stop monitoring live prices.
+                        raise RuntimeError(f"Price stream error: {data['error']}")
+                    ohlc = data.get("ohlc")
+                    if ohlc:
+                        update_count += 1
+                        await check_price_update(
+                            session,
+                            float(ohlc["close"]),
+                            float(ohlc["high"]),
+                            float(ohlc["low"]),
+                        )
+                        if time.time() - last_heartbeat >= 300:
+                            print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price updates received in last ~5 min.")
+                            update_count = 0
                             last_heartbeat = time.time()
         except Exception as e:
             consecutive_failures += 1
-            print(f"⚠️ Tick stream disconnected ({consecutive_failures}x): {e}. Reconnecting in 10s...")
+            print(f"⚠️ Price stream disconnected ({consecutive_failures}x): {e}. Reconnecting in 10s...")
             # Only alert on the first drop and then every 3rd repeated failure,
             # so a single brief network blip doesn't spam Discord.
             if consecutive_failures == 1 or consecutive_failures % 3 == 0:
                 await send_discord_alert(
                     session,
-                    f"⚠️ Live tick stream disconnected (attempt {consecutive_failures}): {e}\nRetrying..."
+                    f"⚠️ Live price stream disconnected (attempt {consecutive_failures}): {e}\nRetrying..."
                 )
             await asyncio.sleep(10)
 

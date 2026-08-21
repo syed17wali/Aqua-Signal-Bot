@@ -39,6 +39,11 @@ GRANULARITY = 900          # 15 min in seconds
 SYMBOL = "frxEURUSD"
 
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")  # Read-only token; required for
+                                                            # live forex subscriptions (frx*),
+                                                            # since those need an authorized
+                                                            # session — public app_id alone
+                                                            # only works for historical data.
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
 PORT = int(os.environ.get("PORT", 10000))
@@ -283,6 +288,16 @@ async def tick_listener_loop(session):
     while True:
         try:
             async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                if DERIV_API_TOKEN:
+                    await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+                    auth_resp = json.loads(await ws.recv())
+                    if "error" in auth_resp:
+                        raise RuntimeError(f"Deriv authorize failed: {auth_resp['error']}")
+                    print(f"[{datetime.now(PKT)}] Authorized with Deriv (read-only token).")
+                else:
+                    print("⚠️ DERIV_API_TOKEN not set — live forex subscription will likely fail "
+                          "with InvalidSymbol, since frx* symbols need an authorized session.")
+
                 # NOTE: raw {"ticks": SYMBOL, "subscribe": 1} was rejected by Deriv
                 # with "Symbol frxEURUSD is invalid" (and the ticks_history+style
                 # "ticks" workaround still hit the same error) — this appears to be

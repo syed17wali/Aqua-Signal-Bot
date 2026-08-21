@@ -343,37 +343,23 @@ async def tick_listener_loop(session):
                             print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price updates received in last ~5 min.")
                             update_count = 0
                             last_heartbeat = time.time()
-                async for raw in ws:
-                    data = json.loads(raw)
-                    if "error" in data:
-                        # Any error here means this subscription is dead — don't sit
-                        # quietly "connected" but receiving nothing. Force a reconnect
-                        # instead, so we never silently stop monitoring live prices.
-                        raise RuntimeError(f"Price stream error: {data['error']}")
-                    ohlc = data.get("ohlc")
-                    if ohlc:
-                        update_count += 1
-                        await check_price_update(
-                            session,
-                            float(ohlc["close"]),
-                            float(ohlc["high"]),
-                            float(ohlc["low"]),
-                        )
-                        if time.time() - last_heartbeat >= 300:
-                            print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price updates received in last ~5 min.")
-                            update_count = 0
-                            last_heartbeat = time.time()
         except Exception as e:
             consecutive_failures += 1
-            print(f"⚠️ Price stream disconnected ({consecutive_failures}x): {e}. Reconnecting in 10s...")
-            # Only alert on the first drop and then every 3rd repeated failure,
-            # so a single brief network blip doesn't spam Discord.
-            if consecutive_failures == 1 or consecutive_failures % 3 == 0:
+            # Back off the retry delay as failures pile up (capped at 2 min), so a
+            # persistent/non-transient error (like a bad token) doesn't hammer
+            # Deriv and Discord every 10 seconds forever.
+            retry_delay = min(10 * consecutive_failures, 120)
+            print(f"⚠️ Price stream disconnected ({consecutive_failures}x): {e}. Reconnecting in {retry_delay}s...")
+            # Alert on the 1st, 2nd, and 3rd failure so real problems get noticed
+            # fast, then taper off to every 10th so a persistent issue doesn't
+            # spam Discord indefinitely.
+            should_alert = consecutive_failures <= 3 or consecutive_failures % 10 == 0
+            if should_alert:
                 await send_discord_alert(
                     session,
                     f"⚠️ Live price stream disconnected (attempt {consecutive_failures}): {e}\nRetrying..."
                 )
-            await asyncio.sleep(10)
+            await asyncio.sleep(retry_delay)
 
 
 # ─── DAILY SUMMARY (midnight PKT) ───────────────────────────────────────

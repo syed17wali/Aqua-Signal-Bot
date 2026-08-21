@@ -38,15 +38,23 @@ FVG_WINDOW_BARS = 36
 GRANULARITY = 900          # 15 min in seconds
 SYMBOL = "frxEURUSD"
 
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID") or "1089"
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")  # Read-only token; required for
-                                                            # live forex subscriptions (frx*),
-                                                            # since those need an authorized
-                                                            # session — public app_id alone
-                                                            # only works for historical data.
-DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "")
+DERIV_APP_ID = (os.environ.get("DERIV_APP_ID") or "1089").strip()
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "").strip()  # .strip() matters: a
+                                                            # trailing space/newline picked
+                                                            # up from copy-paste makes an
+                                                            # otherwise-correct token get
+                                                            # rejected as InvalidToken.
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 PORT = int(os.environ.get("PORT", 10000))
+
+# Safe diagnostic — reveals length and prefix shape only, NEVER the token itself,
+# so we can confirm what Render actually loaded without leaking the secret.
+if DERIV_API_TOKEN:
+    print(f"DERIV_API_TOKEN loaded: length={len(DERIV_API_TOKEN)}, "
+          f"starts_with_pat_={DERIV_API_TOKEN.startswith('pat_')}")
+else:
+    print("DERIV_API_TOKEN loaded: EMPTY — env var not set or not saved on Render.")
 
 PKT = timezone(timedelta(hours=5))
 

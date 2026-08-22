@@ -51,11 +51,20 @@ PORT = int(os.environ.get("PORT", 10000))
 PKT = timezone(timedelta(hours=5))
 
 # ─── SHARED STATE ────────────────────────────────────────────────────────
-state = {"active_bull": [], "active_bear": [], "ema": None, "mid_level": None}
+state = {
+    "active_bull": [], "active_bear": [], "ema": None, "mid_level": None,
+    "last_successful_poll": None,
+}
 state_lock = asyncio.Lock()
 
 daily_counts = {"BUY": 0, "SELL": 0}
 daily_counts_lock = asyncio.Lock()
+
+# Health check considers the bot "unhealthy" if no successful price poll has
+# happened within this many seconds. POLL_INTERVAL is 12s normally, and the
+# retry backoff on failure can go up to 120s — 150s gives a safety buffer so
+# a normal retry cycle doesn't falsely trip this.
+HEALTH_STALE_THRESHOLD = 150
 
 
 # ─── DERIV DATA FETCH ────────────────────────────────────────────────────
@@ -335,6 +344,7 @@ async def tick_listener_loop(session):
             close, high, low = await fetch_current_forming_candle()
             update_count += 1
             await check_price_update(session, close, high, low)
+            state["last_successful_poll"] = time.time()
             if consecutive_failures >= 3:
                 await send_discord_alert(session, "✅ Live price polling recovered — bot is back to normal.")
             consecutive_failures = 0
@@ -380,6 +390,16 @@ async def daily_summary_loop(session):
 
 # ─── HEALTH ENDPOINT (keeps Render web service alive) ──────────────────
 async def health(request):
+    last = state.get("last_successful_poll")
+    if last is None:
+        # Still starting up — hasn't had a chance to poll yet, don't fail this.
+        return web.Response(text="OK (starting up)")
+    age = time.time() - last
+    if age > HEALTH_STALE_THRESHOLD:
+        return web.Response(
+            status=500,
+            text=f"UNHEALTHY: last successful price poll was {age:.0f}s ago (threshold {HEALTH_STALE_THRESHOLD}s)"
+        )
     return web.Response(text="OK")
 
 

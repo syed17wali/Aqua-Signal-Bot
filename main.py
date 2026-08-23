@@ -7,6 +7,12 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Added Deriv rate-limit-specific handling: a dedicated DerivRateLimitError
+  is raised when Deriv's response indicates a rate limit (vs. a generic
+  error), and the poll loop backs off a fixed 60s in that case instead of
+  the normal faster-escalating generic retry delay — avoids hammering the
+  API with quick retries into the same limit window.
+
 - Added nightly scheduled restart (~3:00 AM PKT) timed to the forex market's
   daily rollover gap (~10-15 min low/no-liquidity window each night), so the
   bot proactively refreshes memory during a quiet period instead of waiting
@@ -126,6 +132,27 @@ NIGHTLY_RESTART_MINUTE_PKT = 0
 
 
 # ─── DERIV DATA FETCH ────────────────────────────────────────────────────
+class DerivRateLimitError(RuntimeError):
+    """Raised specifically when Deriv responds with a rate-limit error, so
+    callers can back off longer/differently than for a generic API error."""
+    pass
+
+
+def _raise_for_deriv_error(response):
+    """Centralized error check for Deriv responses. Distinguishes a
+    rate-limit response (Deriv error code containing 'RateLimit', or a
+    message mentioning it) from other API errors, since a rate limit
+    should be handled with a longer, fixed backoff — retrying quickly
+    would just keep tripping the same limit."""
+    if "error" in response:
+        err = response["error"]
+        code = str(err.get("code", "")).lower()
+        message = str(err.get("message", "")).lower()
+        if "ratelimit" in code or "rate limit" in message or "too many requests" in message:
+            raise DerivRateLimitError(f"Deriv rate limit: {err}")
+        raise RuntimeError(f"Deriv API error: {err}")
+
+
 async def deriv_request(payload, timeout=20):
     uri = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
     async with websockets.connect(uri, open_timeout=timeout) as ws:
@@ -149,8 +176,7 @@ async def fetch_closed_candles(count=300, max_retries=3):
     for attempt in range(1, max_retries + 1):
         try:
             response = await deriv_request(request)
-            if "error" in response:
-                raise RuntimeError(f"Deriv API error: {response['error']}")
+            _raise_for_deriv_error(response)
             if not response.get("candles"):
                 raise RuntimeError(f"No candles in response: {response}")
             break
@@ -370,8 +396,7 @@ async def fetch_current_forming_candle():
         "granularity": GRANULARITY,
     }
     response = await deriv_request(request, timeout=15)
-    if "error" in response:
-        raise RuntimeError(f"Deriv API error: {response['error']}")
+    _raise_for_deriv_error(response)
     candles = response.get("candles")
     if not candles:
         raise RuntimeError(f"No candles in response: {response}")
@@ -381,6 +406,13 @@ async def fetch_current_forming_candle():
 
 POLL_INTERVAL = 12  # seconds — frequent enough to catch intra-candle FVG
                      # retests promptly, without hammering Deriv's API.
+
+RATE_LIMIT_BACKOFF = 60  # seconds — fixed wait specifically for rate-limit
+                          # errors (Deriv's limit windows are typically
+                          # rolling per-minute, so a 60s pause gives the
+                          # window time to reset instead of retrying into
+                          # the same limit repeatedly with the normal
+                          # escalating-but-faster generic backoff).
 
 
 async def tick_listener_loop(session):
@@ -394,6 +426,7 @@ async def tick_listener_loop(session):
     app_id that the legacy websocket endpoint itself rejects with HTTP
     401 — both dead ends for this use case, and neither is needed here)."""
     consecutive_failures = 0
+    rate_limit_hits = 0
     update_count = 0
     last_heartbeat = time.time()
 
@@ -406,11 +439,27 @@ async def tick_listener_loop(session):
             if consecutive_failures >= 3:
                 await send_discord_alert(session, "✅ Live price polling recovered — bot is back to normal.")
             consecutive_failures = 0
+            rate_limit_hits = 0
             if time.time() - last_heartbeat >= 300:
                 print(f"[{datetime.now(PKT)}] Heartbeat: {update_count} price polls in last ~5 min.")
                 update_count = 0
                 last_heartbeat = time.time()
             await asyncio.sleep(POLL_INTERVAL)
+        except DerivRateLimitError as e:
+            # Handled separately from generic failures: always wait the
+            # full fixed RATE_LIMIT_BACKOFF, regardless of how many times
+            # this has happened, since retrying sooner would likely just
+            # hit the same limit again.
+            rate_limit_hits += 1
+            consecutive_failures += 1
+            print(f"⏳ Deriv rate limit hit ({rate_limit_hits}x): {e}. Backing off {RATE_LIMIT_BACKOFF}s...")
+            should_alert = rate_limit_hits <= 2 or rate_limit_hits % 10 == 0
+            if should_alert:
+                await send_discord_alert(
+                    session,
+                    f"⏳ Deriv rate limit hit (attempt {rate_limit_hits}) — backing off {RATE_LIMIT_BACKOFF}s before retrying."
+                )
+            await asyncio.sleep(RATE_LIMIT_BACKOFF)
         except Exception as e:
             consecutive_failures += 1
             retry_delay = min(10 * consecutive_failures, 120)

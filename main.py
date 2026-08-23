@@ -7,6 +7,17 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Added crash-loop protection: tracks restarts across process lifetimes via
+  a small /tmp file (best-effort — may not survive a full container
+  recreation, only a simple process restart). If 3+ restarts happen within
+  a 10-min rolling window, the watchdog stops forcing further self-restarts
+  for the rest of that run (switches to alert-only/"degraded mode") so we
+  don't trip Render's own crash-loop protection and get the service killed
+  entirely. Only gates the watchdog's own voluntary restarts — the nightly
+  scheduled restart and Render-initiated deploy/SIGTERM shutdowns are left
+  alone since those are controlled, legitimate reasons to restart, not
+  symptoms of an unresolved bug.
+
 - Added a watchdog: an independent loop (checks every 60s) that verifies
   the price-polling and candle-refresh loops have each actually succeeded
   recently (tracked via state["last_successful_poll"] /
@@ -114,6 +125,59 @@ DISCORD_CHANNEL_ID = os.environ.get("DISCORD_CHANNEL_ID", "").strip()
 PORT = int(os.environ.get("PORT", 10000))
 
 PKT = timezone(timedelta(hours=5))
+
+# ─── CRASH-LOOP PROTECTION ───────────────────────────────────────────────
+# Tracks restarts across process lifetimes using a small local file. If the
+# process has restarted too many times in quick succession (regardless of
+# WHY — watchdog, a fatal crash, anything), that means restarting isn't
+# actually fixing the problem, and continuing to self-restart risks
+# tripping Render's own crash-loop protection (which could stop the service
+# entirely). In that case we deliberately STOP self-restarting and switch
+# to alert-only mode instead — better to stay up and noisy than get killed.
+#
+# CAVEAT: this file lives in /tmp, which normally survives a simple process
+# restart within the same container, but is NOT guaranteed to survive
+# Render fully recreating the container (e.g. a redeploy). It's a
+# best-effort safeguard, not a hard guarantee — but it costs nothing to
+# have and helps in the most common case (a process crashing/restarting
+# repeatedly within the same running instance).
+RESTART_TRACKER_FILE = "/tmp/restart_tracker.json"
+RAPID_RESTART_WINDOW = 600     # seconds — restarts within this window of
+                                # each other count as "rapid succession"
+CRASH_LOOP_THRESHOLD = 3       # this many rapid restarts in a row trips it
+
+
+def check_and_record_restart():
+    """Call once at startup. Returns True if a crash-loop is detected
+    (i.e. self-restarting should be disabled for this process's lifetime)."""
+    now = time.time()
+    try:
+        with open(RESTART_TRACKER_FILE, "r") as f:
+            data = json.load(f)
+        last_restart = data.get("last_restart_time", 0)
+        rapid_count = data.get("rapid_restart_count", 0)
+    except Exception:
+        last_restart = 0
+        rapid_count = 0
+
+    if last_restart and (now - last_restart) < RAPID_RESTART_WINDOW:
+        rapid_count += 1
+    else:
+        rapid_count = 1  # not rapid-following-another — reset the counter
+
+    try:
+        with open(RESTART_TRACKER_FILE, "w") as f:
+            json.dump({"last_restart_time": now, "rapid_restart_count": rapid_count}, f)
+    except Exception as e:
+        print(f"Warning: couldn't write restart tracker file: {e}")
+
+    print(f"[{datetime.now(PKT)}] Startup #{rapid_count} within the last {RAPID_RESTART_WINDOW}s window.")
+    return rapid_count >= CRASH_LOOP_THRESHOLD
+
+
+# Set once at import time; read by the watchdog and the shutdown handlers
+# to decide whether self-restarting is currently allowed.
+CRASH_LOOP_DETECTED = check_and_record_restart()
 
 # ─── SHARED STATE ────────────────────────────────────────────────────────
 state = {
@@ -559,37 +623,65 @@ async def nightly_restart_loop(session):
 # like asyncio.CancelledError slipping past a loop's own `except Exception`.
 async def watchdog_loop(session):
     start_time = time.time()
+    degraded_mode_announced = False
+    last_degraded_alert = 0
+
     while True:
         await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
         now = time.time()
 
         last_poll = state.get("last_successful_poll") or start_time
         poll_age = now - last_poll
-        if poll_age > WATCHDOG_POLL_STALE_THRESHOLD:
-            msg = (
-                f"🐛 WATCHDOG: Live price polling hasn't succeeded in {poll_age:.0f}s "
-                f"(should happen every ~{POLL_INTERVAL}s). The polling loop appears "
-                f"stuck without triggering its own error handling. Forcing a restart."
-            )
-            print(msg)
-            await send_discord_alert(session, msg)
-            await asyncio.sleep(1)
-            os._exit(1)  # non-zero exit code — distinguishes a watchdog-forced
-                          # restart from the graceful nightly one (exit 0) if
-                          # ever inspected in Render's process logs
-
         last_refresh = state.get("last_successful_refresh") or start_time
         refresh_age = now - last_refresh
-        if refresh_age > WATCHDOG_REFRESH_STALE_THRESHOLD:
-            msg = (
-                f"🐛 WATCHDOG: Candle refresh hasn't succeeded in {refresh_age / 60:.0f} min "
-                f"(should happen every ~15 min). The refresh loop appears stuck "
-                f"without triggering its own error handling. Forcing a restart."
+
+        stale_reason = None
+        if poll_age > WATCHDOG_POLL_STALE_THRESHOLD:
+            stale_reason = (
+                f"Live price polling hasn't succeeded in {poll_age:.0f}s "
+                f"(should happen every ~{POLL_INTERVAL}s)."
             )
-            print(msg)
-            await send_discord_alert(session, msg)
-            await asyncio.sleep(1)
-            os._exit(1)
+        elif refresh_age > WATCHDOG_REFRESH_STALE_THRESHOLD:
+            stale_reason = (
+                f"Candle refresh hasn't succeeded in {refresh_age / 60:.0f} min "
+                f"(should happen every ~15 min)."
+            )
+
+        if stale_reason is None:
+            continue
+
+        if CRASH_LOOP_DETECTED:
+            # Restarting repeatedly hasn't fixed this — stop self-restarting
+            # so we don't trip Render's own crash-loop protection. Alert
+            # instead, throttled so it doesn't spam every single check.
+            if not degraded_mode_announced:
+                await send_discord_alert(
+                    session,
+                    "🚨 CRASH-LOOP PROTECTION ACTIVE: This process has restarted too many "
+                    "times in quick succession, and the problem is still happening "
+                    f"({stale_reason}). To avoid Render shutting the service down entirely, "
+                    "auto-restart is now DISABLED for this run — the bot will keep alerting "
+                    "but won't restart itself anymore. Please check Render's Logs tab and "
+                    "fix the underlying issue, then manually redeploy."
+                )
+                degraded_mode_announced = True
+                last_degraded_alert = now
+            elif now - last_degraded_alert > 300:  # remind every 5 min, not more often
+                await send_discord_alert(
+                    session,
+                    f"🚨 Still degraded (crash-loop protection active): {stale_reason} "
+                    "Manual fix + redeploy needed."
+                )
+                last_degraded_alert = now
+            continue  # do NOT restart
+
+        msg = f"🐛 WATCHDOG: {stale_reason} The loop appears stuck without triggering its own error handling. Forcing a restart."
+        print(msg)
+        await send_discord_alert(session, msg)
+        await asyncio.sleep(1)
+        os._exit(1)  # non-zero exit code — distinguishes a watchdog-forced
+                      # restart from the graceful nightly one (exit 0) if
+                      # ever inspected in Render's process logs
 
 
 # ─── HEALTH ENDPOINT (keeps Render web service alive) ──────────────────

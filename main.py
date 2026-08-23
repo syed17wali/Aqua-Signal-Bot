@@ -7,6 +7,16 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Added a watchdog: an independent loop (checks every 60s) that verifies
+  the price-polling and candle-refresh loops have each actually succeeded
+  recently (tracked via state["last_successful_poll"] /
+  state["last_successful_refresh"]). If either has gone stale beyond a
+  generous threshold, it sends a distinct "🐛 WATCHDOG" Discord alert and
+  force-restarts the process — this catches failure modes that wouldn't
+  raise a catchable exception inside the affected loop itself (e.g. a
+  genuine deadlock, or an exception type like asyncio.CancelledError that
+  a plain `except Exception` won't catch).
+
 - Added Deriv rate-limit-specific handling: a dedicated DerivRateLimitError
   is raised when Deriv's response indicates a rate limit (vs. a generic
   error), and the poll loop backs off a fixed 60s in that case instead of
@@ -108,7 +118,10 @@ PKT = timezone(timedelta(hours=5))
 # ─── SHARED STATE ────────────────────────────────────────────────────────
 state = {
     "active_bull": [], "active_bear": [], "ema": None, "mid_level": None,
-    "last_successful_poll": None,
+    "last_successful_poll": None,       # updated by tick_listener_loop
+    "last_successful_refresh": None,    # updated by refresh_candles — used by
+                                         # the watchdog to detect a stuck/dead
+                                         # refresh loop (see WATCHDOG section)
 }
 state_lock = asyncio.Lock()
 
@@ -120,6 +133,18 @@ daily_counts_lock = asyncio.Lock()
 # retry backoff on failure can go up to 120s — 150s gives a safety buffer so
 # a normal retry cycle doesn't falsely trip this.
 HEALTH_STALE_THRESHOLD = 150
+
+# ─── WATCHDOG THRESHOLDS ─────────────────────────────────────────────────
+# The watchdog is a separate, independent check that doesn't rely on a loop
+# correctly catching its own errors — it just asks "has this loop actually
+# succeeded recently?" and force-restarts if not. This catches failure modes
+# the normal try/except handling inside each loop might miss entirely (e.g.
+# a silent deadlock, or an exception type that isn't a subclass of Exception
+# such as asyncio.CancelledError, which `except Exception` won't catch).
+WATCHDOG_CHECK_INTERVAL = 60          # how often the watchdog itself checks, in seconds
+WATCHDOG_POLL_STALE_THRESHOLD = 300   # price polling should never go 5 min without success
+WATCHDOG_REFRESH_STALE_THRESHOLD = 2700  # candle refresh should never go 45 min without success
+                                          # (normal cadence is ~15 min; 3x buffer for retries)
 
 # Nightly proactive restart time (PKT). Timed to land inside forex's daily
 # rollover gap (~10-15 min of low/no liquidity each night, roughly when
@@ -306,6 +331,7 @@ async def refresh_candles(session):
             state["active_bear"] = active_bear
             state["ema"] = context["ema"]
             state["mid_level"] = context["mid_level"]
+            state["last_successful_refresh"] = time.time()
         print(f"[{datetime.now(PKT)}] Refreshed. Active FVGs: {len(active_bull)} bull, {len(active_bear)} bear.")
 
         # Free the DataFrame explicitly and force a GC pass. pandas/numpy can
@@ -523,6 +549,49 @@ async def nightly_restart_loop(session):
         os._exit(0)  # Render restarts the service automatically after this
 
 
+# ─── WATCHDOG ────────────────────────────────────────────────────────────
+# Independent supervisor that doesn't trust the other loops' own error
+# handling to be perfect. It just checks "has each loop actually succeeded
+# recently?" using the timestamps they record in `state`, and force-restarts
+# the whole process (with a distinct Discord alert first) if either looks
+# stuck. This is the safety net for failure modes that wouldn't otherwise
+# raise a catchable exception — e.g. a genuine deadlock, or an event type
+# like asyncio.CancelledError slipping past a loop's own `except Exception`.
+async def watchdog_loop(session):
+    start_time = time.time()
+    while True:
+        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+        now = time.time()
+
+        last_poll = state.get("last_successful_poll") or start_time
+        poll_age = now - last_poll
+        if poll_age > WATCHDOG_POLL_STALE_THRESHOLD:
+            msg = (
+                f"🐛 WATCHDOG: Live price polling hasn't succeeded in {poll_age:.0f}s "
+                f"(should happen every ~{POLL_INTERVAL}s). The polling loop appears "
+                f"stuck without triggering its own error handling. Forcing a restart."
+            )
+            print(msg)
+            await send_discord_alert(session, msg)
+            await asyncio.sleep(1)
+            os._exit(1)  # non-zero exit code — distinguishes a watchdog-forced
+                          # restart from the graceful nightly one (exit 0) if
+                          # ever inspected in Render's process logs
+
+        last_refresh = state.get("last_successful_refresh") or start_time
+        refresh_age = now - last_refresh
+        if refresh_age > WATCHDOG_REFRESH_STALE_THRESHOLD:
+            msg = (
+                f"🐛 WATCHDOG: Candle refresh hasn't succeeded in {refresh_age / 60:.0f} min "
+                f"(should happen every ~15 min). The refresh loop appears stuck "
+                f"without triggering its own error handling. Forcing a restart."
+            )
+            print(msg)
+            await send_discord_alert(session, msg)
+            await asyncio.sleep(1)
+            os._exit(1)
+
+
 # ─── HEALTH ENDPOINT (keeps Render web service alive) ──────────────────
 async def health(request):
     last = state.get("last_successful_poll")
@@ -576,6 +645,7 @@ async def main():
             tick_listener_loop(session),
             daily_summary_loop(session),
             nightly_restart_loop(session),
+            watchdog_loop(session),
         )
 
 

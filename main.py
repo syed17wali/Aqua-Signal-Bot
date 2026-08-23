@@ -1,6 +1,55 @@
 """
 SMC Real-Time Signal Bot — Render version
-Persistent process: live Deriv tick stream + intra-candle FVG retest detection.
+Persistent process: live Deriv price monitoring + intra-candle FVG retest detection.
+
+═══════════════════════════════════════════════════════════════════════════
+CHANGELOG (most recent first) — kept so this file is self-explanatory if
+shared with another AI/developer without the original chat history.
+═══════════════════════════════════════════════════════════════════════════
+
+- Added nightly scheduled restart (~3:00 AM PKT) timed to the forex market's
+  daily rollover gap (~10-15 min low/no-liquidity window each night), so the
+  bot proactively refreshes memory during a quiet period instead of waiting
+  for Render to force-restart it mid-session when the 512MB free-tier memory
+  limit is hit unpredictably.
+
+- Made /health endpoint "smart": it now checks how long ago the last
+  successful price poll happened (state["last_successful_poll"]) and
+  returns HTTP 500 if stale (> HEALTH_STALE_THRESHOLD seconds), instead of
+  always returning 200 OK regardless of whether monitoring is actually
+  working. This lets UptimeRobot's own down-alert (email) fire on a real
+  stall, not just a fully-dead process.
+
+- Added gc.collect() + explicit `del df` after each candle refresh, to
+  reduce (not eliminate) the gradual RSS growth typical of long-running
+  pandas/numpy processes, given Render's free tier only has 512MB RAM.
+
+- Switched real-time monitoring from a raw Deriv WebSocket "ticks"
+  subscription to POLLING the currently-forming candle's high/low/close
+  every ~12s via a one-shot (non-subscribed) ticks_history request. This
+  was necessary because BOTH raw "ticks" subscribe and "candles"
+  subscribe (subscribe:1) were rejected by Deriv with "InvalidSymbol" for
+  frxEURUSD — live subscriptions on forex (frx*) symbols appear to
+  require an authorized session, which added complexity; polling
+  one-shot historical/current-candle requests works fine anonymously
+  (same as the public candle-history fetch already used for indicators).
+  This also fixed a deeper accuracy issue: checking one exact tick price
+  against the FVG zone could miss a real touch if price moved through the
+  zone between polls — using the candle's own high/low (which Deriv
+  tracks continuously server-side regardless of poll timing) mirrors the
+  Pine Script's "touched = (low <= top) and (high >= bot)" logic much
+  more closely.
+
+- Fixed a UTC/PKT timezone bug in earlier iterations of this bot's candle
+  fetching (now moot since Deriv's own timestamps are used consistently).
+
+- Original version: Twelve Data REST API (60+ liquidity-provider
+  aggregate) on a 15-min GitHub Actions cron — replaced entirely by this
+  Deriv-based persistent-process design for (a) a single-broker feed that
+  matches the TradingView chart's own Deriv feed, and (b) real-time
+  intra-candle signal detection instead of waiting for each 15-min candle
+  to close.
+═══════════════════════════════════════════════════════════════════════════
 """
 
 import asyncio
@@ -65,6 +114,15 @@ daily_counts_lock = asyncio.Lock()
 # retry backoff on failure can go up to 120s — 150s gives a safety buffer so
 # a normal retry cycle doesn't falsely trip this.
 HEALTH_STALE_THRESHOLD = 150
+
+# Nightly proactive restart time (PKT). Timed to land inside forex's daily
+# rollover gap (~10-15 min of low/no liquidity each night, roughly when
+# it's 5 PM New York time — currently ~2:00-2:15 AM PKT during US Daylight
+# Saving, shifting to ~3:00-3:15 AM PKT when US DST ends in Nov). 3:00 AM
+# PKT is a safe middle-ground pick; adjust here if the actual gap timing
+# is observed to differ.
+NIGHTLY_RESTART_HOUR_PKT = 3
+NIGHTLY_RESTART_MINUTE_PKT = 0
 
 
 # ─── DERIV DATA FETCH ────────────────────────────────────────────────────
@@ -388,6 +446,34 @@ async def daily_summary_loop(session):
         await send_discord_alert(session, msg)
 
 
+# ─── NIGHTLY PROACTIVE RESTART ──────────────────────────────────────────
+# Instead of waiting for Render to force-restart this instance whenever the
+# 512MB free-tier memory limit gets hit (which can happen at any random
+# time, including active market hours), we restart ourselves once a day at
+# a fixed, predictable time that lands inside forex's own daily low-activity
+# rollover gap — so any brief ~20-25s startup gap coincides with a period
+# when the market itself is quiet anyway, minimizing the chance a real
+# signal is missed because of it.
+async def nightly_restart_loop(session):
+    while True:
+        now_pkt = datetime.now(PKT)
+        target = now_pkt.replace(
+            hour=NIGHTLY_RESTART_HOUR_PKT, minute=NIGHTLY_RESTART_MINUTE_PKT,
+            second=0, microsecond=0
+        )
+        if now_pkt >= target:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now_pkt).total_seconds())
+
+        await send_discord_alert(
+            session,
+            f"🌙 Scheduled nightly restart ({NIGHTLY_RESTART_HOUR_PKT:02d}:{NIGHTLY_RESTART_MINUTE_PKT:02d} PKT) — "
+            "routine memory refresh, timed to forex's low-activity rollover window. Back up shortly."
+        )
+        await asyncio.sleep(1)  # let the alert actually go out before exiting
+        os._exit(0)  # Render restarts the service automatically after this
+
+
 # ─── HEALTH ENDPOINT (keeps Render web service alive) ──────────────────
 async def health(request):
     last = state.get("last_successful_poll")
@@ -440,6 +526,7 @@ async def main():
             refresh_candles_loop(session),
             tick_listener_loop(session),
             daily_summary_loop(session),
+            nightly_restart_loop(session),
         )
 
 

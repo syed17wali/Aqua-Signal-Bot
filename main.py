@@ -8,15 +8,16 @@ shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
 - Added log_fvg_diagnostics(): prints exact indicator values (close, ema,
-  swing_high/low, mid_level) and each FVG-birth boolean (raw_fvg,
-  discount/premium filter, trend filter) for the last 3 candles, once per
-  15-min refresh. Added because "Active FVGs: 0 bull, 0 bear" was
-  persisting for hours (Aug 24, ~04:35-06:30 PKT logs) while TradingView's
-  own Deriv-fed chart showed a clear BUY signal at 05:25 — meaning the
-  bot's FVG-birth conditions are never true, but the existing logs gave no
-  way to see WHICH of the three AND'd conditions is the blocker. This is
-  diagnostic only — it does NOT fix the missing-signal issue by itself;
-  the actual fix depends on what this logging reveals next refresh cycle.
+  swing_high/low, mid_level) and each FVG-birth boolean for the last 3
+  candles, PLUS a full-300-candle-window scan counting how many raw
+  bull/bear gaps exist at all (before the discount/premium/trend filters),
+  with the most recent few printed. The last-3-only version couldn't
+  distinguish "raw gaps never form" from "raw gaps form but always get
+  filtered out afterward" — this scan makes that distinction directly
+  visible instead of guessing. Added because "Active FVGs: 0 bull, 0 bear"
+  was persisting for hours while TradingView's own Deriv-fed chart showed
+  clear BUY signals (e.g. Aug 24 ~05:25 and Aug 25 ~05:40 PKT) — this is
+  diagnostic only, the actual fix depends on what this reveals next cycle.
 - Added crash-loop protection: tracks restarts across process lifetimes via
   a small /tmp file (best-effort — may not survive a full container
   recreation, only a simple process restart). If 3+ restarts happen within
@@ -401,7 +402,18 @@ def log_fvg_diagnostics(df):
     clear BUY/SELL signals) gives no clue WHICH of the three AND'd
     conditions (raw_fvg / discount-premium filter / trend filter) is the
     one always failing — this makes that visible directly in the logs
-    instead of guessing blind."""
+    instead of guessing blind.
+
+    ALSO scans the FULL fetched window (not just the last 3 candles) for
+    any raw_bull_fvg / raw_bear_fvg = True occurrence. This distinguishes
+    two very different possible causes of 'always 0 active FVGs':
+      (a) raw gaps essentially never form at all in our calculation
+          (points to a bug in the gap-size formula/threshold), vs.
+      (b) raw gaps DO form reasonably often, but always get filtered out
+          by the discount/premium or trend condition afterward (points to
+          a bug in one of those filters instead).
+    Prints the most recent few raw-gap occurrences found (if any) so we
+    can see their actual timestamps/values."""
     last = df.tail(3)
     print(f"[{datetime.now(PKT)}] --- FVG diagnostic (last 3 candles) ---")
     for _, row in last.iterrows():
@@ -422,6 +434,30 @@ def log_fvg_diagnostics(df):
             f"trend_dn={bool(row['bearish_trend'])} "
             f"=> new_bear_fvg={bool(row['new_bear_fvg'])}"
         )
+
+    bull_raw_count = int(df["raw_bull_fvg"].sum())
+    bear_raw_count = int(df["raw_bear_fvg"].sum())
+    bull_born_count = int(df["new_bull_fvg"].sum())
+    bear_born_count = int(df["new_bear_fvg"].sum())
+    print(
+        f"[{datetime.now(PKT)}] --- FVG full-window scan ({len(df)} candles) --- "
+        f"raw_bull={bull_raw_count} raw_bear={bear_raw_count} "
+        f"(after discount/premium+trend filters: born_bull={bull_born_count} born_bear={bear_born_count})"
+    )
+    if bull_raw_count > 0:
+        recent_bull = df[df["raw_bull_fvg"]].tail(3)
+        for _, row in recent_bull.iterrows():
+            print(
+                f"    [raw bull gap] {row['time']} close={row['close']:.5f} "
+                f"discount={bool(row['is_discount_fvg'])} trend_up={bool(row['bullish_trend'])}"
+            )
+    if bear_raw_count > 0:
+        recent_bear = df[df["raw_bear_fvg"]].tail(3)
+        for _, row in recent_bear.iterrows():
+            print(
+                f"    [raw bear gap] {row['time']} close={row['close']:.5f} "
+                f"premium={bool(row['is_premium_fvg'])} trend_dn={bool(row['bearish_trend'])}"
+            )
 
 
 async def refresh_candles(session):

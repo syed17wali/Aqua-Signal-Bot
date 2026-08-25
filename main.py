@@ -7,6 +7,18 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Added EMA_TOLERANCE (0.0001) to is_discount_fvg / is_premium_fvg: the
+  full-window scan below found real raw FVGs WERE forming (e.g. Aug 24
+  00:00 and 00:15), and their "discount zone" check passed fine, but the
+  "gap_mid > ema" check failed by a razor-thin margin — 0.00005-0.00018
+  (under 2 pips on EURUSD). Root cause: our REST candle fetch and
+  TradingView's live Pine rendering are both fed by Deriv, but through
+  different pipelines, so their EMA values can differ by that tiny
+  amount — negligible in general, but enough to flip a boundary
+  comparison from True to False. User chose to add tolerance (over
+  leaving it as-is) so these borderline misses count as valid FVGs. This
+  is a deliberate, user-approved loosening of the strategy's exact
+  definition, not a fix to a mistake in the original formula.
 - Added log_fvg_diagnostics(): prints exact indicator values (close, ema,
   swing_high/low, mid_level) and each FVG-birth boolean for the last 3
   candles, PLUS a full-300-candle-window scan counting how many raw
@@ -319,8 +331,19 @@ def calculate_indicators(df):
     df["bull_gap_mid"] = (df["low"] + df["high"].shift(2)) / 2
     df["bear_gap_mid"] = (df["low"].shift(2) + df["high"]) / 2
 
-    df["is_discount_fvg"] = (df["high"].shift(2) < df["mid_level"]) & (df["bull_gap_mid"] > df["ema"])
-    df["is_premium_fvg"] = (df["high"] > df["mid_level"]) & (df["bear_gap_mid"] < df["ema"])
+    # TOLERANCE: our REST candle fetch and TradingView's live Pine rendering
+    # are both fed by Deriv, but through different pipelines, so their EMA
+    # values can differ by a razor-thin amount (observed: 0.00005-0.00018,
+    # under 2 pips on EURUSD) — negligible in general, but enough to flip
+    # this specific comparison from True to False right at the boundary.
+    # EMA_TOLERANCE absorbs exactly that class of borderline miss, so a
+    # signal doesn't get silently dropped over a difference smaller than
+    # typical broker spread. This is a deliberate, small loosening of the
+    # strategy's exact definition — confirmed/approved by the user after
+    # the full-window diagnostic scan below pinpointed this as the cause.
+    EMA_TOLERANCE = 0.0001
+    df["is_discount_fvg"] = (df["high"].shift(2) < df["mid_level"]) & (df["bull_gap_mid"] > df["ema"] - EMA_TOLERANCE)
+    df["is_premium_fvg"] = (df["high"] > df["mid_level"]) & (df["bear_gap_mid"] < df["ema"] + EMA_TOLERANCE)
 
     df["bullish_trend"] = df["close"] > df["ema"]
     df["bearish_trend"] = df["close"] < df["ema"]
@@ -452,24 +475,24 @@ def log_fvg_diagnostics(df):
             # both halves separately shows exactly which one is failing,
             # instead of just the combined True/False result.
             cond1 = row["bull_fvg_bot"] < row["mid_level"]
-            cond2 = row["bull_gap_mid"] > row["ema"]
+            cond2 = row["bull_gap_mid"] > row["ema"] - EMA_TOLERANCE
             print(
                 f"    [raw bull gap] {row['time']} close={row['close']:.5f} "
                 f"trend_up={bool(row['bullish_trend'])} discount={bool(row['is_discount_fvg'])} "
                 f"| cond1 high[2]({row['bull_fvg_bot']:.5f}) < mid({row['mid_level']:.5f}) = {cond1} "
-                f"| cond2 gap_mid({row['bull_gap_mid']:.5f}) > ema({row['ema']:.5f}) = {cond2}"
+                f"| cond2 gap_mid({row['bull_gap_mid']:.5f}) > ema-tol({row['ema'] - EMA_TOLERANCE:.5f}) = {cond2}"
             )
     if bear_raw_count > 0:
         recent_bear = df[df["raw_bear_fvg"]].tail(3)
         for _, row in recent_bear.iterrows():
             # is_premium_fvg = (high > mid_level) AND (bear_gap_mid < ema).
             cond1 = row["high"] > row["mid_level"]
-            cond2 = row["bear_gap_mid"] < row["ema"]
+            cond2 = row["bear_gap_mid"] < row["ema"] + EMA_TOLERANCE
             print(
                 f"    [raw bear gap] {row['time']} close={row['close']:.5f} "
                 f"trend_dn={bool(row['bearish_trend'])} premium={bool(row['is_premium_fvg'])} "
                 f"| cond1 high({row['high']:.5f}) > mid({row['mid_level']:.5f}) = {cond1} "
-                f"| cond2 gap_mid({row['bear_gap_mid']:.5f}) < ema({row['ema']:.5f}) = {cond2}"
+                f"| cond2 gap_mid({row['bear_gap_mid']:.5f}) < ema+tol({row['ema'] + EMA_TOLERANCE:.5f}) = {cond2}"
             )
 
 

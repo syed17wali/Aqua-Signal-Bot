@@ -447,16 +447,29 @@ def log_fvg_diagnostics(df):
     if bull_raw_count > 0:
         recent_bull = df[df["raw_bull_fvg"]].tail(3)
         for _, row in recent_bull.iterrows():
+            # is_discount_fvg = (high[2] < mid_level) AND (bull_gap_mid > ema).
+            # bull_fvg_bot IS high[2] (see calculate_indicators) — printing
+            # both halves separately shows exactly which one is failing,
+            # instead of just the combined True/False result.
+            cond1 = row["bull_fvg_bot"] < row["mid_level"]
+            cond2 = row["bull_gap_mid"] > row["ema"]
             print(
                 f"    [raw bull gap] {row['time']} close={row['close']:.5f} "
-                f"discount={bool(row['is_discount_fvg'])} trend_up={bool(row['bullish_trend'])}"
+                f"trend_up={bool(row['bullish_trend'])} discount={bool(row['is_discount_fvg'])} "
+                f"| cond1 high[2]({row['bull_fvg_bot']:.5f}) < mid({row['mid_level']:.5f}) = {cond1} "
+                f"| cond2 gap_mid({row['bull_gap_mid']:.5f}) > ema({row['ema']:.5f}) = {cond2}"
             )
     if bear_raw_count > 0:
         recent_bear = df[df["raw_bear_fvg"]].tail(3)
         for _, row in recent_bear.iterrows():
+            # is_premium_fvg = (high > mid_level) AND (bear_gap_mid < ema).
+            cond1 = row["high"] > row["mid_level"]
+            cond2 = row["bear_gap_mid"] < row["ema"]
             print(
                 f"    [raw bear gap] {row['time']} close={row['close']:.5f} "
-                f"premium={bool(row['is_premium_fvg'])} trend_dn={bool(row['bearish_trend'])}"
+                f"trend_dn={bool(row['bearish_trend'])} premium={bool(row['is_premium_fvg'])} "
+                f"| cond1 high({row['high']:.5f}) > mid({row['mid_level']:.5f}) = {cond1} "
+                f"| cond2 gap_mid({row['bear_gap_mid']:.5f}) < ema({row['ema']:.5f}) = {cond2}"
             )
 
 

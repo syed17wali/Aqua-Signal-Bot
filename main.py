@@ -7,6 +7,13 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Extended EMA_TOLERANCE to check_price_update()'s live trigger comparisons
+  (price vs ema, price vs fvg mid) — these have the exact same two-pipeline
+  precision-mismatch exposure as the birth condition did (live-polled
+  "price" vs "ema"/"mid" computed from the separate historical-candle
+  fetch), so a valid retest could have been silently missed at the
+  trigger stage even after the birth-condition fix. User caught that the
+  two conditions were inconsistent and asked for this to be fixed too.
 - Added EMA_TOLERANCE (0.0001) to is_discount_fvg / is_premium_fvg: the
   full-window scan below found real raw FVGs WERE forming (e.g. Aug 24
   00:00 and 00:15), and their "discount zone" check passed fine, but the
@@ -559,18 +566,24 @@ async def check_price_update(session, price, candle_high, candle_low):
         ema, mid = state["ema"], state["mid_level"]
         if ema is None or mid is None:
             return
-        bullish_trend = price > ema
-        bearish_trend = price < ema
+        # Same EMA_TOLERANCE as calculate_indicators (see SETTINGS) — "price"
+        # here comes from the live poll (tick_listener_loop), while "ema"/
+        # "mid" come from the separate historical-candle fetch
+        # (refresh_candles). That's the same two-pipeline split that caused
+        # the birth-condition mismatch, so these boundary comparisons get
+        # the same tolerance for consistency, not just the birth check.
+        bullish_trend = price > ema - EMA_TOLERANCE
+        bearish_trend = price < ema + EMA_TOLERANCE
 
         for fvg in list(state["active_bull"]):
             touched = (candle_low <= fvg["top"]) and (candle_high >= fvg["bot"])
-            if touched and bullish_trend and price < fvg["mid"]:
+            if touched and bullish_trend and price < fvg["mid"] + EMA_TOLERANCE:
                 triggered.append(("BUY", fvg))
                 state["active_bull"].remove(fvg)
 
         for fvg in list(state["active_bear"]):
             touched = (candle_high >= fvg["bot"]) and (candle_low <= fvg["top"])
-            if touched and bearish_trend and price > fvg["mid"]:
+            if touched and bearish_trend and price > fvg["mid"] - EMA_TOLERANCE:
                 triggered.append(("SELL", fvg))
                 state["active_bear"].remove(fvg)
 

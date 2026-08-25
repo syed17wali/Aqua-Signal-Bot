@@ -133,6 +133,15 @@ import aiohttp
 # ─── SETTINGS ────────────────────────────────────────────────────────────
 LOOKBACK_LEN = 100
 FVG_SIZE_PCT = 0.05
+# Our REST candle fetch and TradingView's live Pine rendering are both fed
+# by Deriv, but through different pipelines, so their EMA values can differ
+# by a razor-thin amount (observed: 0.00005-0.00018, under 2 pips on
+# EURUSD) — negligible in general, but enough to flip a boundary comparison
+# from True to False. This tolerance absorbs exactly that class of
+# borderline miss. Deliberate, user-approved loosening of the strategy's
+# exact definition — see CHANGELOG. Module-level (not local to
+# calculate_indicators) so log_fvg_diagnostics can reference the same value.
+EMA_TOLERANCE = 0.0001
 EMA_LEN = 25
 FVG_WINDOW_BARS = 36
 GRANULARITY = 900          # 15 min in seconds
@@ -331,17 +340,10 @@ def calculate_indicators(df):
     df["bull_gap_mid"] = (df["low"] + df["high"].shift(2)) / 2
     df["bear_gap_mid"] = (df["low"].shift(2) + df["high"]) / 2
 
-    # TOLERANCE: our REST candle fetch and TradingView's live Pine rendering
-    # are both fed by Deriv, but through different pipelines, so their EMA
-    # values can differ by a razor-thin amount (observed: 0.00005-0.00018,
-    # under 2 pips on EURUSD) — negligible in general, but enough to flip
-    # this specific comparison from True to False right at the boundary.
-    # EMA_TOLERANCE absorbs exactly that class of borderline miss, so a
-    # signal doesn't get silently dropped over a difference smaller than
-    # typical broker spread. This is a deliberate, small loosening of the
-    # strategy's exact definition — confirmed/approved by the user after
-    # the full-window diagnostic scan below pinpointed this as the cause.
-    EMA_TOLERANCE = 0.0001
+    # EMA_TOLERANCE (module-level constant, see SETTINGS) absorbs a tiny,
+    # inherent EMA mismatch between our REST feed and TradingView's live
+    # Pine feed, so a genuinely-valid FVG doesn't get silently dropped over
+    # a difference smaller than typical broker spread.
     df["is_discount_fvg"] = (df["high"].shift(2) < df["mid_level"]) & (df["bull_gap_mid"] > df["ema"] - EMA_TOLERANCE)
     df["is_premium_fvg"] = (df["high"] > df["mid_level"]) & (df["bear_gap_mid"] < df["ema"] + EMA_TOLERANCE)
 

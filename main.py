@@ -7,25 +7,16 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
-- Extended EMA_TOLERANCE to check_price_update()'s live trigger comparisons
-  (price vs ema, price vs fvg mid) — these have the exact same two-pipeline
-  precision-mismatch exposure as the birth condition did (live-polled
-  "price" vs "ema"/"mid" computed from the separate historical-candle
-  fetch), so a valid retest could have been silently missed at the
-  trigger stage even after the birth-condition fix. User caught that the
-  two conditions were inconsistent and asked for this to be fixed too.
-- Added EMA_TOLERANCE (0.0001) to is_discount_fvg / is_premium_fvg: the
-  full-window scan below found real raw FVGs WERE forming (e.g. Aug 24
-  00:00 and 00:15), and their "discount zone" check passed fine, but the
-  "gap_mid > ema" check failed by a razor-thin margin — 0.00005-0.00018
-  (under 2 pips on EURUSD). Root cause: our REST candle fetch and
-  TradingView's live Pine rendering are both fed by Deriv, but through
-  different pipelines, so their EMA values can differ by that tiny
-  amount — negligible in general, but enough to flip a boundary
-  comparison from True to False. User chose to add tolerance (over
-  leaving it as-is) so these borderline misses count as valid FVGs. This
-  is a deliberate, user-approved loosening of the strategy's exact
-  definition, not a fix to a mistake in the original formula.
+- Fixed FVG_SIZE_PCT: was 0.05, corrected to 0.01 after confirming directly
+  from the user's live TradingView chart label ("...100 0.01 25 36") that
+  this was wrong all along — 5x too strict. Likely the single biggest
+  cause of missed signals to date, bigger than the EMA-tolerance issue
+  found earlier the same day. Found because the user had TWO indicators
+  on their chart with different parameter sets and pointed out which one
+  they actually trade off of — always worth re-verifying against the live
+  chart's own indicator label rather than assuming prior settings are
+  still correct.
+
 - Added log_fvg_diagnostics(): prints exact indicator values (close, ema,
   swing_high/low, mid_level) and each FVG-birth boolean for the last 3
   candles, PLUS a full-300-candle-window scan counting how many raw
@@ -139,20 +130,36 @@ import aiohttp
 
 # ─── SETTINGS ────────────────────────────────────────────────────────────
 LOOKBACK_LEN = 100
-FVG_SIZE_PCT = 0.05
-# Our REST candle fetch and TradingView's live Pine rendering are both fed
-# by Deriv, but through different pipelines, so their EMA values can differ
-# by a razor-thin amount (observed: 0.00005-0.00018, under 2 pips on
-# EURUSD) — negligible in general, but enough to flip a boundary comparison
-# from True to False. This tolerance absorbs exactly that class of
-# borderline miss. Deliberate, user-approved loosening of the strategy's
-# exact definition — see CHANGELOG. Module-level (not local to
-# calculate_indicators) so log_fvg_diagnostics can reference the same value.
-EMA_TOLERANCE = 0.0001
+FVG_SIZE_PCT = 0.01   # CORRECTED Aug 27 — was 0.05 (5x too strict), confirmed
+                        # wrong against the user's actual live Pine Script
+                        # ("SMC Pro Scanner - Model B (Universal: Gold +
+                        # Forex) 100 0.01 25 36" — read directly off the
+                        # TradingView chart's indicator label). This was
+                        # very likely the single biggest cause of missed
+                        # signals so far: at 0.05%, the minimum FVG gap
+                        # size required was 5x larger than what the user's
+                        # actual strategy uses, silently rejecting many
+                        # genuine (but smaller) gaps before they ever got
+                        # a chance to be evaluated.
 EMA_LEN = 25
 FVG_WINDOW_BARS = 36
 GRANULARITY = 900          # 15 min in seconds
 SYMBOL = "frxEURUSD"
+
+# Small tolerance added to the discount/premium (gap_mid vs ema) filter.
+# Diagnostics on Aug 25 showed two REAL FVGs get rejected purely because our
+# calculated EMA differed from TradingView Pine's by a tiny amount (0.00005
+# and 0.00018 — half a pip to under 2 pips), even though the underlying gap
+# and trend conditions were both correct. This isn't a bug in either
+# calculation — Pine's live-rendering engine and our REST candle-history
+# fetch are technically separate pipelines even on the same broker (Deriv),
+# so a little floating-point-level drift between them is expected and can't
+# be fully eliminated. This tolerance is a deliberate STRATEGY ADJUSTMENT
+# (not a bug fix) to stop losing genuinely valid signals to that noise —
+# it makes the filter a bit more forgiving, which is a real trade-off the
+# user explicitly chose over stricter-but-more-frequently-empty matching.
+EMA_TOLERANCE_PCT = 0.03   # 0.03% of price ≈ 0.00035 at ~1.168 — comfortably
+                            # covers both observed misses with margin to spare
 
 DERIV_APP_ID = (os.environ.get("DERIV_APP_ID") or "1089").strip()
 # NOTE: DERIV_API_TOKEN / real Deriv account no longer needed. The bot only
@@ -347,12 +354,14 @@ def calculate_indicators(df):
     df["bull_gap_mid"] = (df["low"] + df["high"].shift(2)) / 2
     df["bear_gap_mid"] = (df["low"].shift(2) + df["high"]) / 2
 
-    # EMA_TOLERANCE (module-level constant, see SETTINGS) absorbs a tiny,
-    # inherent EMA mismatch between our REST feed and TradingView's live
-    # Pine feed, so a genuinely-valid FVG doesn't get silently dropped over
-    # a difference smaller than typical broker spread.
-    df["is_discount_fvg"] = (df["high"].shift(2) < df["mid_level"]) & (df["bull_gap_mid"] > df["ema"] - EMA_TOLERANCE)
-    df["is_premium_fvg"] = (df["high"] > df["mid_level"]) & (df["bear_gap_mid"] < df["ema"] + EMA_TOLERANCE)
+    # Tolerance band applied to the ema comparison only (not the gap-size or
+    # mid_level checks) — see EMA_TOLERANCE_PCT comment above for why.
+    df["ema_tolerance"] = df["close"] * (EMA_TOLERANCE_PCT / 100)
+
+    df["is_discount_fvg"] = (df["high"].shift(2) < df["mid_level"]) & \
+                             (df["bull_gap_mid"] > df["ema"] - df["ema_tolerance"])
+    df["is_premium_fvg"] = (df["high"] > df["mid_level"]) & \
+                            (df["bear_gap_mid"] < df["ema"] + df["ema_tolerance"])
 
     df["bullish_trend"] = df["close"] > df["ema"]
     df["bearish_trend"] = df["close"] < df["ema"]
@@ -479,29 +488,29 @@ def log_fvg_diagnostics(df):
     if bull_raw_count > 0:
         recent_bull = df[df["raw_bull_fvg"]].tail(3)
         for _, row in recent_bull.iterrows():
-            # is_discount_fvg = (high[2] < mid_level) AND (bull_gap_mid > ema).
-            # bull_fvg_bot IS high[2] (see calculate_indicators) — printing
-            # both halves separately shows exactly which one is failing,
-            # instead of just the combined True/False result.
+            # is_discount_fvg = (high[2] < mid_level) AND (bull_gap_mid > ema - tolerance).
+            # bull_fvg_bot IS high[2] (see calculate_indicators).
             cond1 = row["bull_fvg_bot"] < row["mid_level"]
-            cond2 = row["bull_gap_mid"] > row["ema"] - EMA_TOLERANCE
+            cond2 = row["bull_gap_mid"] > (row["ema"] - row["ema_tolerance"])
             print(
                 f"    [raw bull gap] {row['time']} close={row['close']:.5f} "
                 f"trend_up={bool(row['bullish_trend'])} discount={bool(row['is_discount_fvg'])} "
                 f"| cond1 high[2]({row['bull_fvg_bot']:.5f}) < mid({row['mid_level']:.5f}) = {cond1} "
-                f"| cond2 gap_mid({row['bull_gap_mid']:.5f}) > ema-tol({row['ema'] - EMA_TOLERANCE:.5f}) = {cond2}"
+                f"| cond2 gap_mid({row['bull_gap_mid']:.5f}) > ema-tol({row['ema'] - row['ema_tolerance']:.5f}) = {cond2} "
+                f"[tol={row['ema_tolerance']:.5f}]"
             )
     if bear_raw_count > 0:
         recent_bear = df[df["raw_bear_fvg"]].tail(3)
         for _, row in recent_bear.iterrows():
-            # is_premium_fvg = (high > mid_level) AND (bear_gap_mid < ema).
+            # is_premium_fvg = (high > mid_level) AND (bear_gap_mid < ema + tolerance).
             cond1 = row["high"] > row["mid_level"]
-            cond2 = row["bear_gap_mid"] < row["ema"] + EMA_TOLERANCE
+            cond2 = row["bear_gap_mid"] < (row["ema"] + row["ema_tolerance"])
             print(
                 f"    [raw bear gap] {row['time']} close={row['close']:.5f} "
                 f"trend_dn={bool(row['bearish_trend'])} premium={bool(row['is_premium_fvg'])} "
                 f"| cond1 high({row['high']:.5f}) > mid({row['mid_level']:.5f}) = {cond1} "
-                f"| cond2 gap_mid({row['bear_gap_mid']:.5f}) < ema+tol({row['ema'] + EMA_TOLERANCE:.5f}) = {cond2}"
+                f"| cond2 gap_mid({row['bear_gap_mid']:.5f}) < ema+tol({row['ema'] + row['ema_tolerance']:.5f}) = {cond2} "
+                f"[tol={row['ema_tolerance']:.5f}]"
             )
 
 
@@ -566,24 +575,18 @@ async def check_price_update(session, price, candle_high, candle_low):
         ema, mid = state["ema"], state["mid_level"]
         if ema is None or mid is None:
             return
-        # Same EMA_TOLERANCE as calculate_indicators (see SETTINGS) — "price"
-        # here comes from the live poll (tick_listener_loop), while "ema"/
-        # "mid" come from the separate historical-candle fetch
-        # (refresh_candles). That's the same two-pipeline split that caused
-        # the birth-condition mismatch, so these boundary comparisons get
-        # the same tolerance for consistency, not just the birth check.
-        bullish_trend = price > ema - EMA_TOLERANCE
-        bearish_trend = price < ema + EMA_TOLERANCE
+        bullish_trend = price > ema
+        bearish_trend = price < ema
 
         for fvg in list(state["active_bull"]):
             touched = (candle_low <= fvg["top"]) and (candle_high >= fvg["bot"])
-            if touched and bullish_trend and price < fvg["mid"] + EMA_TOLERANCE:
+            if touched and bullish_trend and price < fvg["mid"]:
                 triggered.append(("BUY", fvg))
                 state["active_bull"].remove(fvg)
 
         for fvg in list(state["active_bear"]):
             touched = (candle_high >= fvg["bot"]) and (candle_low <= fvg["top"])
-            if touched and bearish_trend and price > fvg["mid"] - EMA_TOLERANCE:
+            if touched and bearish_trend and price > fvg["mid"]:
                 triggered.append(("SELL", fvg))
                 state["active_bear"].remove(fvg)
 

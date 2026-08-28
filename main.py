@@ -7,6 +7,23 @@ CHANGELOG (most recent first) — kept so this file is self-explanatory if
 shared with another AI/developer without the original chat history.
 ═══════════════════════════════════════════════════════════════════════════
 
+- Fixed a duplicate-signal bug: the SAME FVG zone could re-fire a live
+  BUY/SELL alert repeatedly (observed Aug 28 — one zone fired ~9 times over
+  a few hours) because every 15-min refresh_candles() call fully rebuilds
+  active_bull/active_bear from historical data via rebuild_active_fvgs(),
+  which uses a CLOSE-price-based retest check — while the live real-time
+  check in check_price_update() uses the whole candle's high/low range
+  (more lenient, by design, to mirror Pine's candle-range touch logic).
+  A zone that check_price_update() already fired on could still look
+  "not yet retired" to the historical close-based check, so the next
+  refresh silently re-added it as active, letting it fire again on the
+  next real-time touch — indefinitely, until it aged past FVG_WINDOW_BARS.
+  Fixed by tracking fired FVGs by a stable identity key (their birth
+  candle's actual timestamp — NOT their positional index in the fetched
+  window, which shifts between refreshes) in state["fired_fvg_keys"], and
+  filtering the rebuilt active lists against it every refresh. Old entries
+  are pruned each cycle so this doesn't grow unbounded over long uptime.
+
 - Fixed FVG_SIZE_PCT: was 0.05, corrected to 0.01 after confirming directly
   from the user's live TradingView chart label ("...100 0.01 25 36") that
   this was wrong all along — 5x too strict. Likely the single biggest
@@ -232,8 +249,36 @@ state = {
     "last_successful_refresh": None,    # updated by refresh_candles — used by
                                          # the watchdog to detect a stuck/dead
                                          # refresh loop (see WATCHDOG section)
+    "fired_fvg_keys": set(),            # identity keys of FVGs that already
+                                         # triggered a live signal — see
+                                         # fvg_key() and the Aug 28 changelog
+                                         # entry for why this exists (without
+                                         # it, the SAME FVG could re-fire
+                                         # every refresh cycle indefinitely).
 }
 state_lock = asyncio.Lock()
+
+# How each FVG's identity is uniquely keyed, for fired_fvg_keys tracking.
+# Uses the birth candle's actual TIMESTAMP, not its positional index in the
+# dataframe — the positional index shifts between refreshes as the fetched
+# 300-candle window slides forward, so it can't be used to recognize "is
+# this the same FVG as one we already fired on" across refresh cycles.
+def fvg_key(direction, fvg):
+    return (direction, str(fvg["birth_time"]), round(fvg["top"], 5), round(fvg["bot"], 5))
+
+
+def _key_birth_time_after(key, cutoff):
+    """Used only for pruning fired_fvg_keys — parses the birth_time string
+    back out of a key tuple and compares it to cutoff. Keeps a key if its
+    birth time is missing/unparseable too, erring on the side of not
+    deleting something we're unsure about."""
+    try:
+        birth_time = pd.Timestamp(key[1])
+        if birth_time.tzinfo is None:
+            birth_time = birth_time.tz_localize("UTC")
+        return birth_time > cutoff
+    except Exception:
+        return True
 
 daily_counts = {"BUY": 0, "SELL": 0}
 daily_counts_lock = asyncio.Lock()
@@ -383,11 +428,11 @@ def rebuild_active_fvgs(df):
     for i in range(n):
         row = df.iloc[i]
         if row.get("new_bull_fvg", False):
-            bull_fvgs.append({"bar": i, "top": row["bull_fvg_top"], "bot": row["bull_fvg_bot"],
-                               "mid": row["mid_level"], "retired": False})
+            bull_fvgs.append({"bar": i, "birth_time": row["time"], "top": row["bull_fvg_top"],
+                               "bot": row["bull_fvg_bot"], "mid": row["mid_level"], "retired": False})
         if row.get("new_bear_fvg", False):
-            bear_fvgs.append({"bar": i, "top": row["bear_fvg_top"], "bot": row["bear_fvg_bot"],
-                               "mid": row["mid_level"], "retired": False})
+            bear_fvgs.append({"bar": i, "birth_time": row["time"], "top": row["bear_fvg_top"],
+                               "bot": row["bear_fvg_bot"], "mid": row["mid_level"], "retired": False})
 
         for fvg in bull_fvgs:
             if fvg["retired"]:
@@ -521,13 +566,37 @@ async def refresh_candles(session):
         df = calculate_indicators(df)
         log_fvg_diagnostics(df)
         active_bull, active_bear, context = rebuild_active_fvgs(df)
+
         async with state_lock:
+            # Exclude any FVG we've already fired a live signal on — without
+            # this, the same FVG can get silently re-added as "active" every
+            # 15-min rebuild (since the historical retest check here uses
+            # candle CLOSE only, while the live check in check_price_update
+            # uses the whole candle's high/low range and can fire on a touch
+            # that doesn't end up satisfying the close-based check) and then
+            # fire AGAIN on the next real-time touch — causing repeated
+            # duplicate alerts for one zone that TradingView only signaled
+            # once. See fvg_key() and the Aug 28 changelog entry.
+            fired = state["fired_fvg_keys"]
+            active_bull = [f for f in active_bull if fvg_key("BUY", f) not in fired]
+            active_bear = [f for f in active_bear if fvg_key("SELL", f) not in fired]
+
             state["active_bull"] = active_bull
             state["active_bear"] = active_bear
             state["ema"] = context["ema"]
             state["mid_level"] = context["mid_level"]
             state["last_successful_refresh"] = time.time()
-        print(f"[{datetime.now(PKT)}] Refreshed. Active FVGs: {len(active_bull)} bull, {len(active_bear)} bear.")
+
+            # Prune fired_fvg_keys entries old enough that they'd have aged
+            # out of the active window anyway (with a day's buffer) — keeps
+            # this set from growing forever over weeks/months of uptime.
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=FVG_WINDOW_BARS * GRANULARITY + 86400)
+            state["fired_fvg_keys"] = {
+                k for k in state["fired_fvg_keys"]
+                if _key_birth_time_after(k, cutoff)
+            }
+        print(f"[{datetime.now(PKT)}] Refreshed. Active FVGs: {len(active_bull)} bull, {len(active_bear)} bear. "
+              f"(fired-history: {len(state['fired_fvg_keys'])})")
 
         # Free the DataFrame explicitly and force a GC pass. pandas/numpy can
         # leave allocator-level memory unreturned to the OS even after Python
@@ -583,12 +652,14 @@ async def check_price_update(session, price, candle_high, candle_low):
             if touched and bullish_trend and price < fvg["mid"]:
                 triggered.append(("BUY", fvg))
                 state["active_bull"].remove(fvg)
+                state["fired_fvg_keys"].add(fvg_key("BUY", fvg))
 
         for fvg in list(state["active_bear"]):
             touched = (candle_high >= fvg["bot"]) and (candle_low <= fvg["top"])
             if touched and bearish_trend and price > fvg["mid"]:
                 triggered.append(("SELL", fvg))
                 state["active_bear"].remove(fvg)
+                state["fired_fvg_keys"].add(fvg_key("SELL", fvg))
 
     for signal, fvg in triggered:
         now_str = datetime.now(PKT).strftime("%Y-%m-%d %I:%M:%S %p PKT")
